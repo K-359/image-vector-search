@@ -1,0 +1,7 @@
+torch
+torchvision
+sentence-transformers[image]
+faiss-cpu
+pillow
+numpy
+tqdm
