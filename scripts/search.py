@@ -183,8 +183,7 @@ def rewrite_query_with_ollama(
     timeout: float,
 ) -> str:
     system_prompt = """
-あなたは画像検索システムのためのクエリ変換器です。
-ユーザの生クエリを、画像埋め込み検索に適した短い日本語の視覚描写へ変換してください。
+ユーザのクエリを、画像埋め込み検索に適したクエリに変換してください。
 
 ルール:
 - 出力は検索クエリ本文だけにする
@@ -222,15 +221,12 @@ def answer_with_ollama(
     base_url: str,
     timeout: float,
     image_path: Path | None = None,
-    image_score: float | None = None,
     stream_callback=None,
 ) -> str:
     system_prompt = """
 あなたはユーザの質問に日本語で答えるアシスタントです。
 運転中のユーザが車内で話すクエリを想定してください。
 ユーザのクエリを元に検索された過去の画像が渡される場合があります。
-その場合は、その画像を根拠としてユーザの質問に答えてください。
-画像が渡されていない場合は、通常の質問として自然に答えてください。
 """.strip()
 
     if image_path is None:
@@ -242,15 +238,9 @@ def answer_with_ollama(
         with open(image_path, "rb") as f:
             image_base64 = base64.b64encode(f.read()).decode("ascii")
 
-        score_text = "" if image_score is None else f"\n画像検索スコア: {image_score:.4f}"
         user_message = {
             "role": "user",
-            "content": (
-                "ユーザクエリ:\n"
-                f"{raw_query}\n\n"
-                "添付画像は画像検索で最もスコアが高かった結果です。"
-                f"{score_text}"
-            ),
+            "content": f"ユーザクエリ:\n{raw_query}",
             "images": [image_base64],
         }
 
@@ -501,7 +491,7 @@ def main():
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
             )
         else:
-            best_score, _, best_path = best_image
+            _, _, best_path = best_image
             print()
             print("LLM response:")
             llm_response = answer_with_ollama(
@@ -510,7 +500,6 @@ def main():
                 base_url=args.ollama_url,
                 timeout=args.ollama_timeout,
                 image_path=best_path,
-                image_score=best_score,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
             )
 
