@@ -31,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("query", nargs="?", type=str, help="検索したい内容。例: 夕焼けの海辺を走る犬")
     parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--bottom-k", type=int, default=10, help="下位検索結果として出力する件数。")
     parser.add_argument(
         "--interactive",
         action="store_true",
@@ -40,6 +41,10 @@ def main():
 
     if not args.interactive and not args.query:
         parser.error("query を指定してください。--interactive の場合は省略できます。")
+    if args.top_k < 0:
+        parser.error("--top-k は 0 以上を指定してください。")
+    if args.bottom_k < 0:
+        parser.error("--bottom-k は 0 以上を指定してください。")
 
     index_path = DATA_DIR / "images.faiss"
     paths_path = DATA_DIR / "image_paths.json"
@@ -78,7 +83,10 @@ def main():
             normalize_embeddings=True,
         ).astype("float32")
 
-        scores, ids = index.search(query_embedding, args.top_k)
+        result_count = index.ntotal
+        scores, ids = index.search(query_embedding, result_count)
+        top_results = list(zip(scores[0][: args.top_k], ids[0][: args.top_k]))
+        bottom_results = [] if args.bottom_k == 0 else list(zip(scores[0], ids[0]))[-args.bottom_k :]
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         result_dir = RESULTS_DIR / timestamp
@@ -92,7 +100,8 @@ def main():
         print(f"results: {result_dir}")
         print()
 
-        for rank, (score, image_id) in enumerate(zip(scores[0], ids[0]), start=1):
+        print("top results:")
+        for rank, (score, image_id) in enumerate(top_results, start=1):
             if image_id < 0:
                 continue
 
@@ -103,6 +112,25 @@ def main():
                 continue
 
             dst_name = f"{rank:02d}_{safe_score(float(score))}_{src_path.name}"
+            dst_path = result_dir / dst_name
+
+            shutil.copy2(src_path, dst_path)
+
+            print(f"{rank:02d}  score={score:.4f}  {src_path} -> {dst_path}")
+
+        print()
+        print("bottom results:")
+        for rank, (score, image_id) in enumerate(reversed(bottom_results), start=1):
+            if image_id < 0:
+                continue
+
+            src_path = Path(image_paths[image_id])
+
+            if not src_path.exists():
+                print(f"{rank:02d}  score={score:.4f}  MISSING: {src_path}")
+                continue
+
+            dst_name = f"bottom_{rank:02d}_{safe_score(float(score))}_{src_path.name}"
             dst_path = result_dir / dst_name
 
             shutil.copy2(src_path, dst_path)
