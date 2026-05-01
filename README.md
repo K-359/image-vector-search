@@ -108,6 +108,7 @@ python scripts/search.py "赤い車が雪道を走っている"
 results/
 └── 20260424_153012/
     ├── query.txt
+    ├── raw_query.txt
     ├── 01_0.8123_car_001.jpg
     ├── 02_0.7991_snow_045.jpg
     ├── 03_0.7814_vehicle_120.jpg
@@ -143,7 +144,7 @@ YYYYMMDD_HHMMSS
 02_0.7991_snow_045.jpg
 ```
 
-また、検索に使った入力テキストは以下に保存されます。
+また、検索に使ったクエリは以下に保存されます。
 
 ```text
 query.txt
@@ -153,6 +154,20 @@ query.txt
 
 ```text
 赤い車が雪道を走っている
+```
+
+`query.txt` には実際に検索へ使ったクエリが保存されます。ユーザが入力した元の文は `raw_query.txt` に保存されます。クエリ変換を使わない通常検索では、両方とも同じ内容になります。
+
+Ollama の `qwen3.5:9b` で入力を画像検索向けの短い視覚クエリに変換してから検索したい場合は、`--query-rewrite` を指定します。
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" --query-rewrite
+```
+
+Ollama の接続先やモデルを変える場合は、以下のオプションを使います。
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" --query-rewrite --ollama-url http://localhost:11434 --ollama-model qwen3.5:9b
 ```
 
 ## 検索件数を変更する
@@ -204,7 +219,8 @@ python scripts/search.py "赤い車が雪道を走っている"
 出力例:
 
 ```text
-query: 赤い車が雪道を走っている
+raw query: 赤い車が雪道を走っている
+search query: 赤い車が雪道を走っている
 results: results/20260424_153012
 
 01  score=0.8123  images/car_001.jpg -> results/20260424_153012/01_0.8123_car_001.jpg
@@ -217,7 +233,8 @@ results: results/20260424_153012
 1. `scripts/build_index.py` で画像をベクトル化する
 2. ベクトルを `data/images.faiss` に保存する
 3. 画像パスを `data/image_paths.json` に保存する
-4. `scripts/search.py` で入力テキストをベクトル化する
-5. FAISS で近い画像ベクトルを検索する
-6. 上位画像を `results/実行時刻/` にコピーする
-7. 入力テキストを `query.txt` に保存する
+4. `--query-rewrite` 指定時は、`scripts/search.py` でユーザ入力を Ollama に渡し、画像検索向けクエリへ変換する
+5. 実際に検索へ使うクエリをベクトル化する
+6. FAISS で近い画像ベクトルを検索する
+7. 上位画像を `results/実行時刻/` にコピーする
+8. 元の入力を `raw_query.txt`、検索に使ったクエリを `query.txt` に保存する
