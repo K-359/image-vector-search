@@ -20,6 +20,7 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300.0
 DATA_DIR = Path("data")
 RESULTS_DIR = Path("results")
+IMAGE_DATES_PATH = DATA_DIR / "image_dates.json"
 
 
 def normalize_ollama_base_url(base_url: str) -> str:
@@ -221,6 +222,7 @@ def answer_with_ollama(
     base_url: str,
     timeout: float,
     image_path: Path | None = None,
+    image_date: str | None = None,
     stream_callback=None,
 ) -> str:
     system_prompt = """
@@ -238,9 +240,13 @@ def answer_with_ollama(
         with open(image_path, "rb") as f:
             image_base64 = base64.b64encode(f.read()).decode("ascii")
 
+        content = f"ユーザクエリ:\n{raw_query}"
+        if image_date is not None:
+            content = f"検索された画像の日付: {image_date}\n\n{content}"
+
         user_message = {
             "role": "user",
-            "content": f"ユーザクエリ:\n{raw_query}",
+            "content": content,
             "images": [image_base64],
         }
 
@@ -278,6 +284,36 @@ def find_best_existing_image(
             return float(score), int(image_id), src_path
 
     return None
+
+
+def load_image_dates(path: Path) -> dict[str, str]:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    dates_by_path = payload.get("dates_by_path") if isinstance(payload, dict) else None
+    if not isinstance(dates_by_path, dict):
+        raise RuntimeError(f"{path} は dates_by_path を持つJSONオブジェクトである必要があります。")
+
+    invalid_items = [
+        (image_path, image_date)
+        for image_path, image_date in dates_by_path.items()
+        if not isinstance(image_path, str) or not isinstance(image_date, str)
+    ]
+    if invalid_items:
+        raise RuntimeError(f"{path} に文字列ではないパスまたは日付が含まれています。")
+
+    return dates_by_path
+
+
+def format_date_field(image_path: Path, image_dates: dict[str, str] | None) -> str:
+    if image_dates is None:
+        return ""
+
+    image_date = image_dates.get(str(image_path))
+    if image_date is None:
+        return "  date=UNKNOWN"
+
+    return f"  date={image_date}"
 
 
 def main():
@@ -327,13 +363,14 @@ def main():
 
     index = None
     image_paths = None
+    image_dates = None
     model = None
 
     def load_search_backend():
-        nonlocal index, image_paths, model
+        nonlocal index, image_paths, image_dates, model
 
         if index is not None and image_paths is not None and model is not None:
-            return index, image_paths, model
+            return index, image_paths, image_dates, model
 
         index_path = DATA_DIR / "images.faiss"
         paths_path = DATA_DIR / "image_paths.json"
@@ -352,9 +389,12 @@ def main():
         with open(paths_path, "r", encoding="utf-8") as f:
             image_paths = json.load(f)
 
+        if IMAGE_DATES_PATH.exists():
+            image_dates = load_image_dates(IMAGE_DATES_PATH)
+
         model = SentenceTransformer(MODEL_NAME)
 
-        return index, image_paths, model
+        return index, image_paths, image_dates, model
 
     if args.interactive:
         load_search_backend()
@@ -411,7 +451,7 @@ def main():
                 timeout=args.ollama_timeout,
             )
 
-        index, image_paths, model = load_search_backend()
+        index, image_paths, image_dates, model = load_search_backend()
 
         query_embedding = model.encode(
             [search_query],
@@ -459,7 +499,8 @@ def main():
 
             shutil.copy2(src_path, dst_path)
 
-            print(f"{rank:02d}  score={score:.4f}  {src_path} -> {dst_path}")
+            date_field = format_date_field(src_path, image_dates)
+            print(f"{rank:02d}  score={score:.4f}{date_field}  {src_path} -> {dst_path}")
 
         print()
         print("bottom results:")
@@ -478,7 +519,8 @@ def main():
 
             shutil.copy2(src_path, dst_path)
 
-            print(f"{rank:02d}  score={score:.4f}  {src_path} -> {dst_path}")
+            date_field = format_date_field(src_path, image_dates)
+            print(f"{rank:02d}  score={score:.4f}{date_field}  {src_path} -> {dst_path}")
 
         if best_image is None:
             print()
@@ -492,6 +534,7 @@ def main():
             )
         else:
             _, _, best_path = best_image
+            best_date = None if image_dates is None else image_dates.get(str(best_path))
             print()
             print("LLM response:")
             llm_response = answer_with_ollama(
@@ -500,6 +543,7 @@ def main():
                 base_url=args.ollama_url,
                 timeout=args.ollama_timeout,
                 image_path=best_path,
+                image_date=best_date,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
             )
 
