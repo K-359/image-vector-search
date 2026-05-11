@@ -23,7 +23,7 @@ OLLAMA_TIMEOUT = 300.0
 THINKING_BUDGET_TOKENS = {
     "image_search_decision": 500,
     "query_rewrite": 500,
-    "answer_generation": 1000,
+    "answer_generation": 500,
 }
 DATA_DIR = Path("data")
 RESULTS_DIR = Path("results")
@@ -295,38 +295,43 @@ def chat_with_ollama(
                             stream_callback(content)
 
                 if thinking_budget_exceeded:
-                    thinking = trim_thinking_to_sentence("".join(thinking_parts))
-                    fallback_result = chat_with_ollama(
-                        make_fallback_messages(messages, thinking, error_context),
-                        model_name=model_name,
-                        base_url=base_url,
-                        timeout=timeout,
-                        error_context=error_context,
-                        stream_callback=stream_callback,
-                        thinking_callback=None,
-                        think=False,
-                    )
-                    return OllamaChatResult(
-                        content=fallback_result.content,
-                        thinking=thinking,
-                        thinking_budget_exceeded=True,
-                        fallback_used=True,
-                    )
+                    response.close()
 
-                result = split_think_tags(
-                    "".join(content_parts).strip(),
-                    "".join(thinking_parts).strip(),
-                )
-                if not result.content:
-                    raise RuntimeError(f"Ollama の{error_context}結果が空でした。")
+                if not thinking_budget_exceeded:
+                    result = split_think_tags(
+                        "".join(content_parts).strip(),
+                        "".join(thinking_parts).strip(),
+                    )
+                    if not result.content:
+                        raise RuntimeError(f"Ollama の{error_context}結果が空でした。")
 
-                return result
+                    return result
     except (TimeoutError, urllib.error.URLError) as exc:
         raise RuntimeError(
             f"Ollama で{error_context}できませんでした。"
             f" Ollama が起動しているか、モデル {model_name!r} が利用可能か確認してください。"
             " 推論に時間がかかる場合は --ollama-timeout を大きくしてください。"
         ) from exc
+
+    if stream_response and thinking_budget_exceeded:
+        thinking = trim_thinking_to_sentence("".join(thinking_parts))
+        fallback_result = chat_with_ollama(
+            make_fallback_messages(messages, thinking, error_context),
+            model_name=model_name,
+            base_url=base_url,
+            timeout=timeout,
+            error_context=error_context,
+            stream_callback=stream_callback,
+            thinking_callback=None,
+            think=False,
+        )
+
+        return OllamaChatResult(
+            content=fallback_result.content,
+            thinking=thinking,
+            thinking_budget_exceeded=True,
+            fallback_used=True,
+        )
 
     data = json.loads(response_body)
     message = data.get("message", {})
