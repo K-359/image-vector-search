@@ -2,9 +2,11 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +23,12 @@ OLLAMA_TIMEOUT = 300.0
 DATA_DIR = Path("data")
 RESULTS_DIR = Path("results")
 IMAGE_DATES_PATH = DATA_DIR / "image_dates.json"
+
+
+@dataclass
+class OllamaChatResult:
+    content: str
+    thinking: str
 
 
 def normalize_ollama_base_url(base_url: str) -> str:
@@ -80,6 +88,92 @@ def clean_yes_no(text: str) -> str:
     raise RuntimeError(f"Ollama の画像検索要否判定が Yes/No ではありませんでした: {text!r}")
 
 
+def split_think_tags(content: str, thinking: str) -> OllamaChatResult:
+    """
+    Ollama の現行 API は thinking を message.thinking に分離する。
+    古いモデル/テンプレートで <think>...</think> が本文へ混ざる場合も分離する。
+    """
+    match = re.search(r"<think>\s*(.*?)\s*</think>", content, flags=re.DOTALL)
+    if not match:
+        return OllamaChatResult(content=content.strip(), thinking=thinking.strip())
+
+    extracted_thinking = match.group(1).strip()
+    cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
+    combined_thinking = "\n\n".join(
+        part for part in (thinking.strip(), extracted_thinking) if part
+    )
+    return OllamaChatResult(content=cleaned_content, thinking=combined_thinking)
+
+
+def append_thinking_record(
+    records: list[dict] | None,
+    *,
+    step: str,
+    result: OllamaChatResult,
+) -> None:
+    if records is None:
+        return
+
+    records.append(
+        {
+            "step": step,
+            "thinking": result.thinking,
+            "response": result.content,
+        }
+    )
+
+
+def make_result_dir() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_dir = RESULTS_DIR / timestamp
+    suffix = 2
+
+    while result_dir.exists():
+        result_dir = RESULTS_DIR / f"{timestamp}_{suffix}"
+        suffix += 1
+
+    result_dir.mkdir(parents=True, exist_ok=False)
+    return result_dir
+
+
+def write_ollama_thinking_files(result_dir: Path, records: list[dict]) -> None:
+    with open(result_dir / "ollama_thinking.json", "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    with open(result_dir / "ollama_thinking.txt", "w", encoding="utf-8") as f:
+        for index, record in enumerate(records, start=1):
+            if index > 1:
+                f.write("\n\n")
+
+            f.write(f"# {record['step']}\n")
+            thinking = record.get("thinking") or ""
+            if thinking:
+                f.write(thinking.strip() + "\n")
+            else:
+                f.write("(thinking は空でした)\n")
+
+
+def create_thinking_chunk_writer(result_dir: Path, step: str):
+    output_path = result_dir / "ollama_thinking.txt"
+    section_started = False
+
+    def write_chunk(chunk: str) -> None:
+        nonlocal section_started
+
+        needs_separator = output_path.exists() and output_path.stat().st_size > 0
+        with open(output_path, "a", encoding="utf-8") as f:
+            if not section_started:
+                if needs_separator:
+                    f.write("\n\n")
+                f.write(f"# {step}\n")
+                section_started = True
+            f.write(chunk)
+            f.flush()
+
+    return write_chunk
+
+
 def chat_with_ollama(
     messages: list[dict],
     *,
@@ -88,11 +182,13 @@ def chat_with_ollama(
     timeout: float,
     error_context: str,
     stream_callback=None,
-) -> str:
+    thinking_callback=None,
+) -> OllamaChatResult:
+    stream_response = stream_callback is not None or thinking_callback is not None
     payload = {
         "model": model_name,
         "messages": messages,
-        "stream": stream_callback is not None,
+        "stream": stream_response,
         "think": True,
     }
 
@@ -105,10 +201,11 @@ def chat_with_ollama(
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            if stream_callback is None:
+            if not stream_response:
                 response_body = response.read().decode("utf-8")
             else:
                 content_parts = []
+                thinking_parts = []
                 for raw_line in response:
                     line = raw_line.decode("utf-8").strip()
                     if not line:
@@ -118,16 +215,27 @@ def chat_with_ollama(
                     if chunk.get("error"):
                         raise RuntimeError(f"Ollama の{error_context}中にエラーが発生しました: {chunk['error']}")
 
-                    content = chunk.get("message", {}).get("content", "")
+                    message = chunk.get("message", {})
+                    thinking = message.get("thinking", "") or chunk.get("thinking", "")
+                    if thinking:
+                        thinking_parts.append(thinking)
+                        if thinking_callback is not None:
+                            thinking_callback(thinking)
+
+                    content = message.get("content", "")
                     if content:
                         content_parts.append(content)
-                        stream_callback(content)
+                        if stream_callback is not None:
+                            stream_callback(content)
 
-                content = "".join(content_parts).strip()
-                if not content:
+                result = split_think_tags(
+                    "".join(content_parts).strip(),
+                    "".join(thinking_parts).strip(),
+                )
+                if not result.content:
                     raise RuntimeError(f"Ollama の{error_context}結果が空でした。")
 
-                return content
+                return result
     except (TimeoutError, urllib.error.URLError) as exc:
         raise RuntimeError(
             f"Ollama で{error_context}できませんでした。"
@@ -136,11 +244,15 @@ def chat_with_ollama(
         ) from exc
 
     data = json.loads(response_body)
-    content = data.get("message", {}).get("content", "").strip()
-    if not content:
+    message = data.get("message", {})
+    result = split_think_tags(
+        message.get("content", "").strip(),
+        message.get("thinking", "").strip(),
+    )
+    if not result.content:
         raise RuntimeError(f"Ollama の{error_context}結果が空でした。")
 
-    return content
+    return result
 
 
 def decide_image_search_with_ollama(
@@ -149,6 +261,8 @@ def decide_image_search_with_ollama(
     model_name: str,
     base_url: str,
     timeout: float,
+    thinking_log: list[dict] | None = None,
+    thinking_callback=None,
 ) -> bool:
     system_prompt = """
 運転中のユーザが車内で話すクエリを想定してください。
@@ -162,7 +276,7 @@ def decide_image_search_with_ollama(
 出力は Yes または No のどちらか1語だけにしてください。
 """.strip()
     user_prompt = f"ユーザクエリ:\n{raw_query}"
-    response = chat_with_ollama(
+    result = chat_with_ollama(
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -171,9 +285,11 @@ def decide_image_search_with_ollama(
         base_url=base_url,
         timeout=timeout,
         error_context="画像検索要否判定",
+        thinking_callback=thinking_callback,
     )
+    append_thinking_record(thinking_log, step="image_search_decision", result=result)
 
-    return clean_yes_no(response) == "Yes"
+    return clean_yes_no(result.content) == "Yes"
 
 
 def rewrite_query_with_ollama(
@@ -182,6 +298,8 @@ def rewrite_query_with_ollama(
     model_name: str,
     base_url: str,
     timeout: float,
+    thinking_log: list[dict] | None = None,
+    thinking_callback=None,
 ) -> str:
     system_prompt = """
 ユーザのクエリを、画像埋め込み検索に適したクエリに変換してください。
@@ -189,15 +307,11 @@ def rewrite_query_with_ollama(
 ルール:
 - 出力は検索クエリ本文だけにする
 - 1文または短い名詞句にする
-- 画像に写っていそうな被写体、場所、行動、色、構図、雰囲気を優先する
 - 会話上の依頼、挨拶、検索操作への指示、不要な助詞や曖昧な言い回しは取り除く
-- 画像に見えない意図、評価、推測、メタ情報は足さない
-- 情報が少ない場合は、元クエリの視覚的な語を保ったまま簡潔にする
-- 翻訳や説明はしない
 """.strip()
-    user_prompt = f"ユーザの生クエリ:\n{raw_query}"
+    user_prompt = f"ユーザのクエリ:\n{raw_query}"
 
-    response = chat_with_ollama(
+    result = chat_with_ollama(
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -206,8 +320,10 @@ def rewrite_query_with_ollama(
         base_url=base_url,
         timeout=timeout,
         error_context="検索クエリ変換",
+        thinking_callback=thinking_callback,
     )
-    rewritten_query = clean_llm_query(response)
+    append_thinking_record(thinking_log, step="query_rewrite", result=result)
+    rewritten_query = clean_llm_query(result.content)
 
     if not rewritten_query:
         raise RuntimeError("Ollama の検索クエリ変換結果が空でした。")
@@ -224,11 +340,12 @@ def answer_with_ollama(
     image_path: Path | None = None,
     image_date: str | None = None,
     stream_callback=None,
-) -> str:
+    thinking_callback=None,
+) -> OllamaChatResult:
     system_prompt = """
-あなたはユーザの質問に日本語で答えるアシスタントです。
+ユーザクエリに日本語で回答してください。
 運転中のユーザが車内で話すクエリを想定してください。
-ユーザのクエリを元に検索された過去の画像が渡される場合があります。
+ユーザクエリを元に検索された、過去の車外画像が渡される場合があります。
 """.strip()
 
     if image_path is None:
@@ -260,6 +377,7 @@ def answer_with_ollama(
         timeout=timeout,
         error_context="回答生成",
         stream_callback=stream_callback,
+        thinking_callback=thinking_callback,
     )
 
 
@@ -413,26 +531,46 @@ def main():
 
         raw_query = query
         search_query = raw_query
+        thinking_log = []
+        result_dir = make_result_dir()
+
+        with open(result_dir / "raw_query.txt", "w", encoding="utf-8") as f:
+            f.write(raw_query + "\n")
+
         needs_image_search = decide_image_search_with_ollama(
             raw_query,
             model_name=args.ollama_model,
             base_url=args.ollama_url,
             timeout=args.ollama_timeout,
+            thinking_log=thinking_log,
+            thinking_callback=create_thinking_chunk_writer(result_dir, "image_search_decision"),
         )
 
         print(f"raw query: {raw_query}")
         print(f"needs image search: {'Yes' if needs_image_search else 'No'}")
 
         if not needs_image_search:
+            with open(result_dir / "query.txt", "w", encoding="utf-8") as f:
+                f.write(search_query + "\n")
+
+            print(f"results: {result_dir}")
             print()
             print("LLM response:")
-            llm_response = answer_with_ollama(
+            answer_result = answer_with_ollama(
                 raw_query,
                 model_name=args.ollama_model,
                 base_url=args.ollama_url,
                 timeout=args.ollama_timeout,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
+                thinking_callback=create_thinking_chunk_writer(result_dir, "answer_generation"),
             )
+            append_thinking_record(thinking_log, step="answer_generation", result=answer_result)
+            llm_response = answer_result.content
+
+            with open(result_dir / "llm_response.txt", "w", encoding="utf-8") as f:
+                f.write(llm_response + "\n")
+            write_ollama_thinking_files(result_dir, thinking_log)
+
             if args.interactive:
                 print()
             else:
@@ -449,6 +587,8 @@ def main():
                 model_name=args.ollama_model,
                 base_url=args.ollama_url,
                 timeout=args.ollama_timeout,
+                thinking_log=thinking_log,
+                thinking_callback=create_thinking_chunk_writer(result_dir, "query_rewrite"),
             )
 
         index, image_paths, image_dates, model = load_search_backend()
@@ -468,16 +608,9 @@ def main():
         )
         best_image = find_best_existing_image(list(zip(scores[0], ids[0])), image_paths)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result_dir = RESULTS_DIR / timestamp
-        result_dir.mkdir(parents=True, exist_ok=True)
-
         # 後方互換のため、query.txt には実際に検索へ使ったクエリを保存する。
         with open(result_dir / "query.txt", "w", encoding="utf-8") as f:
             f.write(search_query + "\n")
-
-        with open(result_dir / "raw_query.txt", "w", encoding="utf-8") as f:
-            f.write(raw_query + "\n")
 
         print(f"search query: {search_query}")
         print(f"results: {result_dir}")
@@ -525,19 +658,20 @@ def main():
         if best_image is None:
             print()
             print("LLM response:")
-            llm_response = answer_with_ollama(
+            answer_result = answer_with_ollama(
                 raw_query,
                 model_name=args.ollama_model,
                 base_url=args.ollama_url,
                 timeout=args.ollama_timeout,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
+                thinking_callback=create_thinking_chunk_writer(result_dir, "answer_generation"),
             )
         else:
             _, _, best_path = best_image
             best_date = None if image_dates is None else image_dates.get(str(best_path))
             print()
             print("LLM response:")
-            llm_response = answer_with_ollama(
+            answer_result = answer_with_ollama(
                 raw_query,
                 model_name=args.ollama_model,
                 base_url=args.ollama_url,
@@ -545,10 +679,15 @@ def main():
                 image_path=best_path,
                 image_date=best_date,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
+                thinking_callback=create_thinking_chunk_writer(result_dir, "answer_generation"),
             )
+
+        append_thinking_record(thinking_log, step="answer_generation", result=answer_result)
+        llm_response = answer_result.content
 
         with open(result_dir / "llm_response.txt", "w", encoding="utf-8") as f:
             f.write(llm_response + "\n")
+        write_ollama_thinking_files(result_dir, thinking_log)
 
         if args.interactive:
             print()

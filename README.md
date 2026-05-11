@@ -143,6 +143,9 @@ results/
 └── 20260424_153012/
     ├── query.txt
     ├── raw_query.txt
+    ├── llm_response.txt
+    ├── ollama_thinking.txt
+    ├── ollama_thinking.json
     ├── 01_0.8123_car_001.jpg
     ├── 02_0.7991_snow_045.jpg
     ├── 03_0.7814_vehicle_120.jpg
@@ -191,6 +194,12 @@ query.txt
 ```
 
 `query.txt` には実際に検索へ使ったクエリが保存されます。ユーザが入力した元の文は `raw_query.txt` に保存されます。クエリ変換を使わない通常検索では、両方とも同じ内容になります。
+
+LLM の最終回答は `llm_response.txt` に保存されます。
+Ollama の thinking は `ollama_thinking.txt` に保存され、画像検索要否判定、クエリ変換、回答生成の各ステップごとに確認できます。
+推論中も `ollama_thinking.txt` へ逐次追記され、処理完了後に同じファイルが整形済みの内容で上書きされます。
+同じ内容を機械的に扱いやすい形式で確認したい場合は `ollama_thinking.json` を参照してください。
+画像検索が不要と判定された場合も `results/実行時刻/` は作成され、`raw_query.txt`、`query.txt`、`llm_response.txt`、`ollama_thinking.txt`、`ollama_thinking.json` が保存されます。
 
 検索時は、まず Ollama の `qwen3.5:9b` が回答に過去画像データベースの参照が必要かを `Yes` / `No` で判定します。
 `Yes` の場合は画像検索し、最上位の検索結果画像を LLM に渡して回答を生成します。
@@ -266,6 +275,7 @@ python scripts/search.py "赤い車が雪道を走っている"
 
 ```text
 raw query: 赤い車が雪道を走っている
+needs image search: Yes
 search query: 赤い車が雪道を走っている
 results: results/20260424_153012
 
@@ -286,4 +296,5 @@ results: results/20260424_153012
 8. FAISS で近い画像ベクトルを検索する
 9. 上位画像を `results/実行時刻/` にコピーする
 10. 最上位の検索結果画像を Ollama に渡して回答を生成し、`llm_response.txt` に保存する
-11. 元の入力を `raw_query.txt`、検索に使ったクエリを `query.txt` に保存する
+11. Ollama の thinking を `ollama_thinking.txt` と `ollama_thinking.json` に保存する
+12. 元の入力を `raw_query.txt`、検索に使ったクエリを `query.txt` に保存する
