@@ -20,6 +20,11 @@ MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
 OLLAMA_MODEL_NAME = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300.0
+THINKING_BUDGET_TOKENS = {
+    "image_search_decision": 500,
+    "query_rewrite": 500,
+    "answer_generation": 1000,
+}
 DATA_DIR = Path("data")
 RESULTS_DIR = Path("results")
 IMAGE_DATES_PATH = DATA_DIR / "image_dates.json"
@@ -29,6 +34,8 @@ IMAGE_DATES_PATH = DATA_DIR / "image_dates.json"
 class OllamaChatResult:
     content: str
     thinking: str
+    thinking_budget_exceeded: bool = False
+    fallback_used: bool = False
 
 
 def normalize_ollama_base_url(base_url: str) -> str:
@@ -105,6 +112,44 @@ def split_think_tags(content: str, thinking: str) -> OllamaChatResult:
     return OllamaChatResult(content=cleaned_content, thinking=combined_thinking)
 
 
+def estimate_token_count(text: str) -> int:
+    """
+    厳密な Ollama/Qwen トークナイザではなく、ストリーム中に軽く判定するための概算。
+    CJK文字は1文字1トークン、それ以外は単語・記号単位で数える。
+    """
+    cjk_chars = re.findall(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", text)
+    non_cjk_text = re.sub(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", " ", text)
+    non_cjk_tokens = re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", non_cjk_text)
+    return len(cjk_chars) + len(non_cjk_tokens)
+
+
+def trim_thinking_to_sentence(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+
+    sentence_end = max(
+        text.rfind(mark)
+        for mark in ("。", "．", ".", "!", "?", "！", "？", "\n")
+    )
+    if sentence_end <= 0:
+        return text
+
+    return text[: sentence_end + 1].strip()
+
+
+def make_fallback_messages(messages: list[dict], thinking: str, error_context: str) -> list[dict]:
+    fallback_instruction = f"""
+途中までのthinking:
+{thinking}
+
+上の途中thinkingを参考にしてください。
+これ以上thinkingせず、{error_context}の最終出力だけを返してください。
+元の出力形式の制約を必ず守ってください。
+""".strip()
+    return [*messages, {"role": "user", "content": fallback_instruction}]
+
+
 def append_thinking_record(
     records: list[dict] | None,
     *,
@@ -119,6 +164,8 @@ def append_thinking_record(
             "step": step,
             "thinking": result.thinking,
             "response": result.content,
+            "thinking_budget_exceeded": result.thinking_budget_exceeded,
+            "fallback_used": result.fallback_used,
         }
     )
 
@@ -147,6 +194,11 @@ def write_ollama_thinking_files(result_dir: Path, records: list[dict]) -> None:
                 f.write("\n\n")
 
             f.write(f"# {record['step']}\n")
+            if record.get("thinking_budget_exceeded"):
+                f.write(
+                    f"(thinking budget exceeded; think=False fallback used: "
+                    f"{'yes' if record.get('fallback_used') else 'no'})\n"
+                )
             thinking = record.get("thinking") or ""
             if thinking:
                 f.write(thinking.strip() + "\n")
@@ -183,13 +235,19 @@ def chat_with_ollama(
     error_context: str,
     stream_callback=None,
     thinking_callback=None,
+    think: bool = True,
+    thinking_budget_tokens: int | None = None,
 ) -> OllamaChatResult:
-    stream_response = stream_callback is not None or thinking_callback is not None
+    stream_response = (
+        stream_callback is not None
+        or thinking_callback is not None
+        or thinking_budget_tokens is not None
+    )
     payload = {
         "model": model_name,
         "messages": messages,
         "stream": stream_response,
-        "think": True,
+        "think": think,
     }
 
     request = urllib.request.Request(
@@ -206,6 +264,7 @@ def chat_with_ollama(
             else:
                 content_parts = []
                 thinking_parts = []
+                thinking_budget_exceeded = False
                 for raw_line in response:
                     line = raw_line.decode("utf-8").strip()
                     if not line:
@@ -222,11 +281,37 @@ def chat_with_ollama(
                         if thinking_callback is not None:
                             thinking_callback(thinking)
 
+                        if (
+                            thinking_budget_tokens is not None
+                            and estimate_token_count("".join(thinking_parts)) >= thinking_budget_tokens
+                        ):
+                            thinking_budget_exceeded = True
+                            break
+
                     content = message.get("content", "")
                     if content:
                         content_parts.append(content)
                         if stream_callback is not None:
                             stream_callback(content)
+
+                if thinking_budget_exceeded:
+                    thinking = trim_thinking_to_sentence("".join(thinking_parts))
+                    fallback_result = chat_with_ollama(
+                        make_fallback_messages(messages, thinking, error_context),
+                        model_name=model_name,
+                        base_url=base_url,
+                        timeout=timeout,
+                        error_context=error_context,
+                        stream_callback=stream_callback,
+                        thinking_callback=None,
+                        think=False,
+                    )
+                    return OllamaChatResult(
+                        content=fallback_result.content,
+                        thinking=thinking,
+                        thinking_budget_exceeded=True,
+                        fallback_used=True,
+                    )
 
                 result = split_think_tags(
                     "".join(content_parts).strip(),
@@ -263,6 +348,7 @@ def decide_image_search_with_ollama(
     timeout: float,
     thinking_log: list[dict] | None = None,
     thinking_callback=None,
+    thinking_budget_tokens: int | None = None,
 ) -> bool:
     system_prompt = """
 運転中のユーザが車内で話すクエリを想定してください。
@@ -286,6 +372,7 @@ def decide_image_search_with_ollama(
         timeout=timeout,
         error_context="画像検索要否判定",
         thinking_callback=thinking_callback,
+        thinking_budget_tokens=thinking_budget_tokens,
     )
     append_thinking_record(thinking_log, step="image_search_decision", result=result)
 
@@ -300,6 +387,7 @@ def rewrite_query_with_ollama(
     timeout: float,
     thinking_log: list[dict] | None = None,
     thinking_callback=None,
+    thinking_budget_tokens: int | None = None,
 ) -> str:
     system_prompt = """
 ユーザのクエリを、画像埋め込み検索に適したクエリに変換してください。
@@ -321,6 +409,7 @@ def rewrite_query_with_ollama(
         timeout=timeout,
         error_context="検索クエリ変換",
         thinking_callback=thinking_callback,
+        thinking_budget_tokens=thinking_budget_tokens,
     )
     append_thinking_record(thinking_log, step="query_rewrite", result=result)
     rewritten_query = clean_llm_query(result.content)
@@ -341,6 +430,7 @@ def answer_with_ollama(
     image_date: str | None = None,
     stream_callback=None,
     thinking_callback=None,
+    thinking_budget_tokens: int | None = None,
 ) -> OllamaChatResult:
     system_prompt = """
 ユーザクエリに日本語で回答してください。
@@ -378,6 +468,7 @@ def answer_with_ollama(
         error_context="回答生成",
         stream_callback=stream_callback,
         thinking_callback=thinking_callback,
+        thinking_budget_tokens=thinking_budget_tokens,
     )
 
 
@@ -468,6 +559,24 @@ def main():
         default=OLLAMA_TIMEOUT,
         help="Ollama API のタイムアウト秒数。",
     )
+    parser.add_argument(
+        "--thinking-budget-decision",
+        type=int,
+        default=THINKING_BUDGET_TOKENS["image_search_decision"],
+        help="画像検索要否判定の thinking 概算トークン上限。0 以下で無制限。",
+    )
+    parser.add_argument(
+        "--thinking-budget-rewrite",
+        type=int,
+        default=THINKING_BUDGET_TOKENS["query_rewrite"],
+        help="検索クエリ変換の thinking 概算トークン上限。0 以下で無制限。",
+    )
+    parser.add_argument(
+        "--thinking-budget-answer",
+        type=int,
+        default=THINKING_BUDGET_TOKENS["answer_generation"],
+        help="回答生成の thinking 概算トークン上限。0 以下で無制限。",
+    )
     args = parser.parse_args()
 
     if not args.interactive and not args.query:
@@ -478,6 +587,18 @@ def main():
         parser.error("--bottom-k は 0 以上を指定してください。")
     if args.ollama_timeout <= 0:
         parser.error("--ollama-timeout は 0 より大きい値を指定してください。")
+
+    thinking_budgets = {
+        "image_search_decision": (
+            None if args.thinking_budget_decision <= 0 else args.thinking_budget_decision
+        ),
+        "query_rewrite": (
+            None if args.thinking_budget_rewrite <= 0 else args.thinking_budget_rewrite
+        ),
+        "answer_generation": (
+            None if args.thinking_budget_answer <= 0 else args.thinking_budget_answer
+        ),
+    }
 
     index = None
     image_paths = None
@@ -544,6 +665,7 @@ def main():
             timeout=args.ollama_timeout,
             thinking_log=thinking_log,
             thinking_callback=create_thinking_chunk_writer(result_dir, "image_search_decision"),
+            thinking_budget_tokens=thinking_budgets["image_search_decision"],
         )
 
         print(f"raw query: {raw_query}")
@@ -563,6 +685,7 @@ def main():
                 timeout=args.ollama_timeout,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
                 thinking_callback=create_thinking_chunk_writer(result_dir, "answer_generation"),
+                thinking_budget_tokens=thinking_budgets["answer_generation"],
             )
             append_thinking_record(thinking_log, step="answer_generation", result=answer_result)
             llm_response = answer_result.content
@@ -589,6 +712,7 @@ def main():
                 timeout=args.ollama_timeout,
                 thinking_log=thinking_log,
                 thinking_callback=create_thinking_chunk_writer(result_dir, "query_rewrite"),
+                thinking_budget_tokens=thinking_budgets["query_rewrite"],
             )
 
         index, image_paths, image_dates, model = load_search_backend()
@@ -665,6 +789,7 @@ def main():
                 timeout=args.ollama_timeout,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
                 thinking_callback=create_thinking_chunk_writer(result_dir, "answer_generation"),
+                thinking_budget_tokens=thinking_budgets["answer_generation"],
             )
         else:
             _, _, best_path = best_image
@@ -680,6 +805,7 @@ def main():
                 image_date=best_date,
                 stream_callback=(lambda chunk: print(chunk, end="", flush=True)) if args.interactive else None,
                 thinking_callback=create_thinking_chunk_writer(result_dir, "answer_generation"),
+                thinking_budget_tokens=thinking_budgets["answer_generation"],
             )
 
         append_thinking_record(thinking_log, step="answer_generation", result=answer_result)
