@@ -21,7 +21,7 @@ OLLAMA_MODEL_NAME = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300.0
 THINKING_BUDGET_TOKENS = {
-    "image_search_decision": 500,
+    "image_search_decision": 1500,
     "query_rewrite": 500,
     "answer_generation": 500,
 }
