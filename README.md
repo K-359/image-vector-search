@@ -207,6 +207,12 @@ Ollama の thinking は `ollama_thinking.txt` に保存され、画像検索要�
 検索結果画像を使って回答させるには、`--ollama-model` に画像入力へ対応した Ollama モデルを指定してください。
 `--interactive` では LLM 回答がストリーミング表示されます。
 
+画像検索要否判定をスキップし、常に画像検索が必要なものとして処理する場合は、`--skip-image-search-decision` を指定します。
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" --skip-image-search-decision
+```
+
 画像検索が必要な場合に、Ollama で入力を画像検索向けの短い視覚クエリに変換してから検索したい場合は、`--query-rewrite` を指定します。
 
 ```bash

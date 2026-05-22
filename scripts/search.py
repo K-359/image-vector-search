@@ -546,6 +546,11 @@ def main():
         help="画像検索が必要な場合に、Ollama で入力を画像検索向けクエリに変換してから検索する。",
     )
     parser.add_argument(
+        "--skip-image-search-decision",
+        action="store_true",
+        help="Ollama による画像検索要否判定をスキップし、画像検索が必要なものとして処理する。",
+    )
+    parser.add_argument(
         "--ollama-model",
         default=OLLAMA_MODEL_NAME,
         help=(
@@ -663,15 +668,18 @@ def main():
         with open(result_dir / "raw_query.txt", "w", encoding="utf-8") as f:
             f.write(raw_query + "\n")
 
-        needs_image_search = decide_image_search_with_ollama(
-            raw_query,
-            model_name=args.ollama_model,
-            base_url=args.ollama_url,
-            timeout=args.ollama_timeout,
-            thinking_log=thinking_log,
-            thinking_callback=create_thinking_chunk_writer(result_dir, "image_search_decision"),
-            thinking_budget_tokens=thinking_budgets["image_search_decision"],
-        )
+        if args.skip_image_search_decision:
+            needs_image_search = True
+        else:
+            needs_image_search = decide_image_search_with_ollama(
+                raw_query,
+                model_name=args.ollama_model,
+                base_url=args.ollama_url,
+                timeout=args.ollama_timeout,
+                thinking_log=thinking_log,
+                thinking_callback=create_thinking_chunk_writer(result_dir, "image_search_decision"),
+                thinking_budget_tokens=thinking_budgets["image_search_decision"],
+            )
 
         print(f"raw query: {raw_query}")
         print(f"needs image search: {'Yes' if needs_image_search else 'No'}")
