@@ -15,6 +15,7 @@ Qwen3-VL-Embedding-2B を使って、画像とテキストを同じ埋め込み�
 ├── data/
 │   ├── images.faiss
 │   ├── image_paths.json
+│   ├── image_captions.jsonl
 │   └── image_dates.json
 ├── results/
 │   └── 20260424_153012/
@@ -23,6 +24,7 @@ Qwen3-VL-Embedding-2B を使って、画像とテキストを同じ埋め込み�
 │       └── ...
 ├── scripts/
 │   ├── build_index.py
+│   ├── generate_captions.py
 │   ├── generate_image_dates.py
 │   └── search.py
 ├── requirements.txt
@@ -123,6 +125,50 @@ python scripts/generate_image_dates.py --start-date 2023-01-01 --end-date 2025-1
 `scripts/search.py` は `data/image_dates.json` が存在する場合だけ自動で読み込み、検索結果の表示とLLMへ渡す画像文脈に日付を含めます。
 
 画像を追加・削除・変更した場合は、インデックス作成と日付メタデータ作成を再実行してください。
+
+## 画像キャプションを事前生成する
+
+キャプションに対してベクトル検索や BM25 検索を行う実験用に、画像ごとの車外状況説明を事前生成できます。
+Ollama の `qwen3.5:9b` を `think=False` で呼び出します。
+
+```bash
+python scripts/generate_captions.py
+```
+
+デフォルトでは `data/image_paths.json` に含まれる画像を順に処理し、`data/image_captions.jsonl` に1画像1行で追記します。
+既存の出力に含まれる画像パスは自動でスキップするため、途中で止まった場合も同じコマンドで再開できます。
+キャプションは1件生成するたびに保存されます。
+プロセス停止などで `data/image_captions.jsonl` の末尾に不完全な行が残った場合は、次回起動時にその末尾行だけを削除し、該当画像を未処理として再生成します。
+
+出力例:
+
+```json
+{"schema_version":1,"image_path":"images/sample001.jpg","caption":"片側一車線の道路を走行しており、前方に車両が見えます。","prompt":"入力画像は車内から撮影されたものです。車外の状況説明を日本語で出力してください。改行や段落は必要ありません。","model":"qwen3.5:9b","created_at":"2026-05-22T05:00:00+00:00"}
+```
+
+動作確認として最初の数枚だけ処理する場合:
+
+```bash
+python scripts/generate_captions.py --limit 10
+```
+
+Ollama の接続先やタイムアウトを変える場合:
+
+```bash
+python scripts/generate_captions.py --ollama-url http://localhost:11434 --ollama-timeout 600
+```
+
+既存出力を破棄して最初から作り直す場合:
+
+```bash
+python scripts/generate_captions.py --overwrite
+```
+
+画像単位の失敗で処理を止めず、失敗内容を `data/image_caption_errors.jsonl` に記録して続行する場合:
+
+```bash
+python scripts/generate_captions.py --continue-on-error
+```
 
 ## テキストで画像を検索する
 
