@@ -16,6 +16,8 @@ Qwen3-VL-Embedding-2B を使って、画像とテキストを同じ埋め込み�
 │   ├── images.faiss
 │   ├── image_paths.json
 │   ├── image_captions.jsonl
+│   ├── caption_embeddings.faiss
+│   ├── caption_embeddings_meta.json
 │   └── image_dates.json
 ├── results/
 │   └── 20260424_153012/
@@ -170,6 +172,10 @@ python scripts/generate_captions.py --overwrite
 python scripts/generate_captions.py --continue-on-error
 ```
 
+`scripts/search.py --mode caption` は `data/image_captions.jsonl` を読み込み、初回実行時にキャプション埋め込みの FAISS インデックスを `data/caption_embeddings.faiss` に作成します。
+`data/image_captions.jsonl` の更新時刻、サイズ、件数が変わった場合は自動で作り直します。
+初回インデックス作成は Ollama の検索要否判定モデルを呼ぶ前に実行されるため、埋め込みモデルと Ollama 側の LLM が同時にバッチ生成メモリを使う状態を避けます。
+
 ## テキストで画像を検索する
 
 以下のように検索します。
@@ -178,7 +184,36 @@ python scripts/generate_captions.py --continue-on-error
 python scripts/search.py "赤い車が雪道を走っている"
 ```
 
-デフォルトでは上位10件を検索します。
+デフォルトでは従来の画像ベクトル検索で上位10件を検索します。
+検索方式は `--mode` で切り替えられます。
+
+```bash
+# 従来の画像ベクトル検索
+python scripts/search.py "赤い車が雪道を走っている" --mode image
+
+# 事前生成キャプションを使った、ベクトル検索 + BM25 検索のハイブリッド
+python scripts/search.py "赤い車が雪道を走っている" --mode caption
+```
+
+`caption` モードのハイブリッドスコアは、キャプションベクトル検索順位と BM25 検索順位を RRF (Reciprocal Rank Fusion) で統合します。
+BM25 はスコアが 0 より大きい結果だけを RRF の入力にします。
+RRF の順位定数はデフォルトで `60` です。
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" --mode caption --caption-rrf-k 30
+```
+
+別のキャプションJSONLを使う場合:
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" --mode caption --captions-jsonl data/image_captions.jsonl
+```
+
+初回のキャプション埋め込み生成で GPU メモリが足りない場合は、バッチサイズを下げます。
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" --mode caption --caption-batch-size 8
+```
 
 検索結果は標準出力に表示されるだけでなく、`results/` ディレクトリにもコピーされます。
 
