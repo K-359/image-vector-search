@@ -173,7 +173,8 @@ python scripts/generate_captions.py --continue-on-error
 ```
 
 `scripts/search.py --mode caption` は `data/image_captions.jsonl` を読み込み、初回実行時にキャプション埋め込みの FAISS インデックスを `data/caption_embeddings.faiss` に作成します。
-`data/image_captions.jsonl` の更新時刻、サイズ、件数が変わった場合は自動で作り直します。
+`data/image_captions.jsonl` の末尾にキャプションが追加された場合は、追加分だけを `data/caption_embeddings.faiss` に追記します。
+既存のメタデータと整合しない変更がある場合は自動で作り直します。
 初回インデックス作成は Ollama の検索要否判定モデルを呼ぶ前に実行されるため、埋め込みモデルと Ollama 側の LLM が同時にバッチ生成メモリを使う状態を避けます。
 
 ## テキストで画像を検索する

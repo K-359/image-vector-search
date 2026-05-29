@@ -1,5 +1,6 @@
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -628,40 +629,103 @@ def load_caption_records(path: Path) -> list[CaptionRecord]:
 def caption_index_metadata(captions_path: Path, records: list[CaptionRecord]) -> dict:
     stat = captions_path.stat()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "captions_path": str(captions_path),
         "captions_mtime_ns": stat.st_mtime_ns,
         "captions_size": stat.st_size,
         "caption_count": len(records),
         "model_name": MODEL_NAME,
         "normalize_embeddings": True,
+        "records_sha256": caption_records_sha256(records),
     }
 
 
-def caption_index_is_current(
-    index_path: Path,
-    meta_path: Path,
-    expected_metadata: dict,
-) -> bool:
-    if not index_path.exists() or not meta_path.exists():
-        return False
-
+def load_caption_index_metadata(meta_path: Path) -> dict | None:
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
-            actual_metadata = json.load(f)
+            metadata = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return None
+
+    return metadata if isinstance(metadata, dict) else None
+
+
+def caption_records_sha256(records: list[CaptionRecord]) -> str:
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(record.image_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(record.caption.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def caption_index_is_current(actual_metadata: dict | None, expected_metadata: dict) -> bool:
+    if actual_metadata is None:
         return False
 
-    return all(actual_metadata.get(key) == value for key, value in expected_metadata.items())
+    required_keys = (
+        "captions_path",
+        "captions_mtime_ns",
+        "captions_size",
+        "caption_count",
+        "model_name",
+        "normalize_embeddings",
+    )
+    if not all(actual_metadata.get(key) == expected_metadata[key] for key in required_keys):
+        return False
+
+    actual_schema_version = actual_metadata.get("schema_version")
+    if actual_schema_version == 1:
+        return True
+
+    return (
+        actual_schema_version == expected_metadata["schema_version"]
+        and actual_metadata.get("records_sha256") == expected_metadata["records_sha256"]
+    )
 
 
-def build_caption_vector_index(
+def caption_index_can_append(
+    index,
+    actual_metadata: dict | None,
+    *,
+    captions_path: Path,
+    records: list[CaptionRecord],
+) -> int | None:
+    if actual_metadata is None:
+        return None
+
+    if actual_metadata.get("captions_path") != str(captions_path):
+        return None
+    if actual_metadata.get("model_name") != MODEL_NAME:
+        return None
+    if actual_metadata.get("normalize_embeddings") is not True:
+        return None
+
+    old_count = actual_metadata.get("caption_count")
+    old_size = actual_metadata.get("captions_size")
+    if not isinstance(old_count, int) or not isinstance(old_size, int):
+        return None
+    if old_count <= 0 or old_count >= len(records):
+        return None
+    if old_size > captions_path.stat().st_size:
+        return None
+    if index.ntotal != old_count:
+        return None
+
+    records_sha256 = actual_metadata.get("records_sha256")
+    if records_sha256 is not None and records_sha256 != caption_records_sha256(records[:old_count]):
+        return None
+
+    return old_count
+
+
+def add_caption_embeddings_to_index(
+    index,
     records: list[CaptionRecord],
     *,
+    start_index: int,
     model,
-    index_path: Path,
-    meta_path: Path,
-    metadata: dict,
     batch_size: int,
 ):
     import faiss
@@ -672,8 +736,7 @@ def build_caption_vector_index(
     except ImportError:
         tqdm = None
 
-    index = None
-    starts = range(0, len(records), batch_size)
+    starts = range(start_index, len(records), batch_size)
     iterator = (
         tqdm(starts, desc="Embedding captions")
         if tqdm is not None
@@ -699,6 +762,27 @@ def build_caption_vector_index(
         ids = np.arange(start, start + len(batch)).astype("int64")
         index.add_with_ids(embeddings, ids)
 
+    return index
+
+
+def build_caption_vector_index(
+    records: list[CaptionRecord],
+    *,
+    model,
+    index_path: Path,
+    meta_path: Path,
+    metadata: dict,
+    batch_size: int,
+):
+    import faiss
+
+    index = add_caption_embeddings_to_index(
+        None,
+        records,
+        start_index=0,
+        model=model,
+        batch_size=batch_size,
+    )
     if index is None:
         raise RuntimeError("キャプション埋め込みインデックスを作成できませんでした。")
 
@@ -723,9 +807,37 @@ def load_or_build_caption_vector_index(
     import faiss
 
     metadata = caption_index_metadata(captions_path, records)
-    if caption_index_is_current(index_path, meta_path, metadata):
+    actual_metadata = load_caption_index_metadata(meta_path) if meta_path.exists() else None
+
+    if index_path.exists() and caption_index_is_current(actual_metadata, metadata):
         index = faiss.read_index(str(index_path))
         if index.ntotal == len(records):
+            return index
+
+    if index_path.exists():
+        index = faiss.read_index(str(index_path))
+        append_start = caption_index_can_append(
+            index,
+            actual_metadata,
+            captions_path=captions_path,
+            records=records,
+        )
+        if append_start is not None:
+            print(
+                f"caption vector index に追加分だけを追記します: "
+                f"{len(records) - append_start} captions"
+            )
+            index = add_caption_embeddings_to_index(
+                index,
+                records,
+                start_index=append_start,
+                model=model,
+                batch_size=batch_size,
+            )
+            faiss.write_index(index, str(index_path))
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+                f.write("\n")
             return index
 
     print(f"caption vector index を作成します: {index_path}")
