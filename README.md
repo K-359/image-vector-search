@@ -343,12 +343,26 @@ python scripts/search.py "夕焼けの海辺を走る犬" --top-k 20
 
 ## 注意点
 
-### 画像を変更したらインデックスを作り直す
+### 画像を追加したらインデックスを更新する
 
-`images/` の中身を変更した場合は、検索前に以下を再実行してください。
+`images/` に画像を追加した場合は、検索前に以下を再実行してください。
+既存の `data/images.faiss` と `data/image_paths.json` がある場合は、未登録の画像だけを末尾に追加します。
 
 ```bash
 python scripts/build_index.py
+```
+
+全画像を最初から作り直す場合は `--rebuild` を指定します。
+
+```bash
+python scripts/build_index.py --rebuild
+```
+
+キャプションも追加画像分だけ生成する場合は、インデックス更新後に通常どおり実行します。
+既存の `data/image_captions.jsonl` に含まれる画像は自動でスキップされます。
+
+```bash
+python scripts/generate_captions.py
 ```
 
 ## よく使うコマンド
