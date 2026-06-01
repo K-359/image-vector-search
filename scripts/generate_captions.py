@@ -36,6 +36,7 @@ CAPTION_PROMPT = (
     "車外の状況説明を4文程度の日本語で出力してください。"
     "改行や段落は必要ありません。"
 )
+HIRAGANA_RE = re.compile(r"[\u3041-\u3096\u309d-\u309f]")
 
 
 def normalize_ollama_base_url(base_url: str) -> str:
@@ -130,6 +131,10 @@ def clean_caption(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" \t\r\n\"'「」")
 
 
+def contains_hiragana(text: str) -> bool:
+    return HIRAGANA_RE.search(text) is not None
+
+
 def caption_image_with_ollama(
     image_path: Path,
     *,
@@ -176,6 +181,10 @@ def caption_image_with_ollama(
     caption = clean_caption(message.get("content", ""))
     if not caption:
         raise RuntimeError(f"Ollama のキャプション生成結果が空でした: {image_path}")
+    if not contains_hiragana(caption):
+        raise RuntimeError(
+            f"Ollama のキャプション生成結果にひらがなが含まれていませんでした: {image_path}"
+        )
 
     return caption
 
