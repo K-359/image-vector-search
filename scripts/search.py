@@ -1019,6 +1019,11 @@ def main():
         help="Ollama による画像検索要否判定をスキップし、画像検索が必要なものとして処理する。",
     )
     parser.add_argument(
+        "--skip-answer-generation",
+        action="store_true",
+        help="Ollama による最終回答生成をスキップする。",
+    )
+    parser.add_argument(
         "--ollama-model",
         default=OLLAMA_MODEL_NAME,
         help=(
@@ -1221,6 +1226,16 @@ def main():
                 f.write(search_query + "\n")
 
             print(f"results: {result_dir}")
+            if args.skip_answer_generation:
+                write_ollama_thinking_files(result_dir, thinking_log)
+                print()
+                print("LLM response: skipped")
+
+                if not args.interactive:
+                    break
+                print()
+                continue
+
             print()
             print("LLM response:")
             answer_result = answer_with_ollama(
@@ -1337,6 +1352,16 @@ def main():
             print(f"{rank:02d}  {format_score_fields(result)}{date_field}  {src_path} -> {dst_path}")
             if result.caption is not None:
                 print(f"    caption: {shorten_text(result.caption)}")
+
+        if args.skip_answer_generation:
+            write_ollama_thinking_files(result_dir, thinking_log)
+            print()
+            print("LLM response: skipped")
+
+            if not args.interactive:
+                break
+            print()
+            continue
 
         if best_image is None:
             print()
