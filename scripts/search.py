@@ -20,6 +20,7 @@ except ImportError:
 
 
 MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
+RERANKER_MODEL_NAME = "Qwen/Qwen3-VL-Reranker-2B"
 OLLAMA_MODEL_NAME = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300.0
@@ -36,6 +37,9 @@ CAPTION_INDEX_PATH = DATA_DIR / "caption_embeddings.faiss"
 CAPTION_INDEX_META_PATH = DATA_DIR / "caption_embeddings_meta.json"
 CAPTION_BATCH_SIZE = 5
 CAPTION_RRF_K = 60
+RERANK_CANDIDATES = 50
+RERANKER_BATCH_SIZE = 1
+RERANKER_PROMPT = "Retrieve images relevant to the user's query."
 
 
 @dataclass
@@ -56,6 +60,8 @@ class CaptionRecord:
 class SearchResult:
     score: float
     image_id: int
+    retrieval_score: float | None = None
+    reranker_score: float | None = None
     vector_score: float | None = None
     bm25_score: float | None = None
     caption: str | None = None
@@ -861,7 +867,12 @@ def search_image_vectors(index, model, search_query: str) -> list[SearchResult]:
 
     scores, ids = index.search(query_embedding, index.ntotal)
     return [
-        SearchResult(score=float(score), image_id=int(image_id), vector_score=float(score))
+        SearchResult(
+            score=float(score),
+            image_id=int(image_id),
+            retrieval_score=float(score),
+            vector_score=float(score),
+        )
         for score, image_id in zip(scores[0], ids[0])
         if image_id >= 0
     ]
@@ -911,11 +922,71 @@ def search_caption_hybrid(
         SearchResult(
             score=float(rrf_scores[image_id]),
             image_id=int(image_id),
+            retrieval_score=float(rrf_scores[image_id]),
             vector_score=float(vector_scores[image_id]),
             bm25_score=float(bm25_scores[image_id]),
             caption=records[image_id].caption,
         )
         for image_id in ordered_ids
+    ]
+
+
+def rerank_search_results(
+    ranked_results: list[SearchResult],
+    image_paths: list[str],
+    search_query: str,
+    *,
+    reranker,
+    candidate_count: int,
+    batch_size: int,
+) -> list[SearchResult]:
+    if candidate_count <= 0 or not ranked_results:
+        return ranked_results
+
+    candidates = ranked_results[:candidate_count]
+    pairs = []
+    pair_results = []
+    unrereanked_candidates = []
+
+    for result in candidates:
+        if not 0 <= result.image_id < len(image_paths):
+            unrereanked_candidates.append(result)
+            continue
+
+        image_path = Path(image_paths[result.image_id])
+        if not image_path.exists():
+            unrereanked_candidates.append(result)
+            continue
+
+        document = {"image": str(image_path.resolve())}
+        if result.caption is not None:
+            document["text"] = result.caption
+
+        pairs.append((search_query, document))
+        pair_results.append(result)
+
+    if not pairs:
+        return ranked_results
+
+    scores = reranker.predict(
+        pairs,
+        batch_size=batch_size,
+        prompt=RERANKER_PROMPT,
+        show_progress_bar=len(pairs) > batch_size,
+    )
+    for result, score in zip(pair_results, scores):
+        result.reranker_score = float(score)
+        result.score = float(score)
+
+    reranked_candidates = sorted(
+        pair_results,
+        key=lambda result: result.reranker_score,
+        reverse=True,
+    )
+    return [
+        *reranked_candidates,
+        *unrereanked_candidates,
+        *ranked_results[candidate_count:],
     ]
 
 
@@ -950,7 +1021,12 @@ def format_date_field(image_path: Path, image_dates: dict[str, str] | None) -> s
 
 
 def format_score_fields(result: SearchResult) -> str:
-    fields = [f"score={result.score:.4f}"]
+    if result.reranker_score is not None:
+        fields = [f"reranker={result.reranker_score:.4f}"]
+        if result.retrieval_score is not None:
+            fields.append(f"retrieval={result.retrieval_score:.4f}")
+    else:
+        fields = [f"score={result.score:.4f}"]
     if result.vector_score is not None:
         fields.append(f"vector={result.vector_score:.4f}")
     if result.bm25_score is not None:
@@ -979,6 +1055,26 @@ def main():
     )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--bottom-k", type=int, default=10, help="下位検索結果として出力する件数。")
+    parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=RERANK_CANDIDATES,
+        help=(
+            "Qwen3-VL-Reranker-2B で再ランキングする初段検索の上位件数。"
+            f"0 で無効。デフォルト: {RERANK_CANDIDATES}"
+        ),
+    )
+    parser.add_argument(
+        "--reranker-model",
+        default=RERANKER_MODEL_NAME,
+        help=f"再ランキングに使うモデル。デフォルト: {RERANKER_MODEL_NAME}",
+    )
+    parser.add_argument(
+        "--reranker-batch-size",
+        type=int,
+        default=RERANKER_BATCH_SIZE,
+        help=f"再ランキング時のバッチサイズ。デフォルト: {RERANKER_BATCH_SIZE}",
+    )
     parser.add_argument(
         "--captions-jsonl",
         type=Path,
@@ -1068,6 +1164,10 @@ def main():
         parser.error("--top-k は 0 以上を指定してください。")
     if args.bottom_k < 0:
         parser.error("--bottom-k は 0 以上を指定してください。")
+    if args.rerank_candidates < 0:
+        parser.error("--rerank-candidates は 0 以上を指定してください。")
+    if args.reranker_batch_size <= 0:
+        parser.error("--reranker-batch-size は 1 以上を指定してください。")
     if args.caption_rrf_k <= 0:
         parser.error("--caption-rrf-k は 1 以上を指定してください。")
     if args.caption_batch_size <= 0:
@@ -1094,6 +1194,7 @@ def main():
     caption_records = None
     caption_bm25_index = None
     model = None
+    reranker = None
 
     def load_embedding_model():
         nonlocal model
@@ -1104,6 +1205,16 @@ def main():
             model = SentenceTransformer(MODEL_NAME)
 
         return model
+
+    def load_reranker():
+        nonlocal reranker
+
+        if reranker is None:
+            from sentence_transformers import CrossEncoder
+
+            reranker = CrossEncoder(args.reranker_model)
+
+        return reranker
 
     def load_image_dates_once():
         nonlocal image_dates
@@ -1180,11 +1291,15 @@ def main():
             load_image_search_backend()
         else:
             load_caption_search_backend()
+        if args.rerank_candidates > 0:
+            load_reranker()
         print("検索文を入力してください。終了するには空行または Ctrl-D を入力してください。")
     elif args.mode == "caption":
         # 初回のキャプション埋め込み生成はメモリを多く使うため、
-        # Ollama の判定/回答用モデルをロードする前に済ませる。
+        # Reranker と Ollama の判定/回答用モデルをロードする前に済ませる。
         load_caption_search_backend()
+        if args.rerank_candidates > 0:
+            load_reranker()
 
     while True:
         if args.interactive:
@@ -1295,6 +1410,16 @@ def main():
                 caption_records_for_search,
                 search_query,
                 rrf_k=args.caption_rrf_k,
+            )
+
+        if args.rerank_candidates > 0:
+            ranked_results = rerank_search_results(
+                ranked_results,
+                image_paths,
+                search_query,
+                reranker=load_reranker(),
+                candidate_count=args.rerank_candidates,
+                batch_size=args.reranker_batch_size,
             )
 
         top_results = ranked_results[: args.top_k]

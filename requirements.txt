@@ -1,6 +1,6 @@
 torch
 torchvision
-sentence-transformers[image]
+sentence-transformers[image]>=5.4.0
 faiss-cpu
 pillow
 numpy

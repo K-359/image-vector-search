@@ -1,8 +1,9 @@
-# Text-Based Image Retrieval with Qwen3-VL-Embedding-2B
+# Text-Based Image Retrieval with Qwen3-VL-Embedding-2B and Qwen3-VL-Reranker-2B
 
 `images/` ディレクトリ内の画像から、入力テキストに意味的に近い画像を検索するプログラムです。
 
 Qwen3-VL-Embedding-2B を使って、画像とテキストを同じ埋め込み空間のベクトルに変換し、FAISS で類似検索します。
+初段検索の上位候補は Qwen3-VL-Reranker-2B で再ランキングします。
 
 ## ディレクトリ構成
 
@@ -196,6 +197,20 @@ python scripts/search.py "赤い車が雪道を走っている" --mode image
 python scripts/search.py "赤い車が雪道を走っている" --mode caption
 ```
 
+どちらのモードも、初段検索の上位50件をデフォルトで Qwen3-VL-Reranker-2B に渡します。
+`image` モードでは画像、`caption` モードでは画像とキャプションを組み合わせて再ランキングします。
+
+```bash
+# 再ランキングする候補数を変更
+python scripts/search.py "赤い車が雪道を走っている" --rerank-candidates 100
+
+# GPUメモリに余裕がある場合はバッチサイズを上げて高速化
+python scripts/search.py "赤い車が雪道を走っている" --reranker-batch-size 4
+
+# 再ランキングを無効化
+python scripts/search.py "赤い車が雪道を走っている" --rerank-candidates 0
+```
+
 `caption` モードのハイブリッドスコアは、キャプションベクトル検索順位と BM25 検索順位を RRF (Reciprocal Rank Fusion) で統合します。
 BM25 はスコアが 0 より大きい結果だけを RRF の入力にします。
 RRF の順位定数はデフォルトで `60` です。
@@ -287,7 +302,8 @@ Ollama の thinking は `ollama_thinking.txt` に保存され、画像検索要�
 `Yes` の場合は画像検索し、最上位の検索結果画像を LLM に渡して回答を生成します。
 `No` の場合は画像検索を行わず、LLM が通常のテキスト質問として回答します。
 検索結果画像を使って回答させるには、`--ollama-model` に画像入力へ対応した Ollama モデルを指定してください。
-`--interactive` では LLM 回答がストリーミング表示されます。
+`--interactive` では、入力待ちを開始する前に Qwen3-VL-Embedding-2B と
+Qwen3-VL-Reranker-2B をロードし、LLM 回答をストリーミング表示します。
 
 画像検索要否判定をスキップし、常に画像検索が必要なものとして処理する場合は、`--skip-image-search-decision` を指定します。
 
