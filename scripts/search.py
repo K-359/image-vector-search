@@ -39,7 +39,10 @@ CAPTION_BATCH_SIZE = 5
 CAPTION_RRF_K = 60
 RERANK_CANDIDATES = 50
 RERANKER_BATCH_SIZE = 1
-RERANKER_PROMPT = "Retrieve images relevant to the user's query."
+DASHCAM_RETRIEVAL_PROMPT = (
+    "Retrieve dashcam images that visually show the road scene, traffic participant, "
+    "dangerous behavior, collision, or near-miss event described in the user's query."
+)
 
 
 @dataclass
@@ -860,7 +863,7 @@ def load_or_build_caption_vector_index(
 def search_image_vectors(index, model, search_query: str) -> list[SearchResult]:
     query_embedding = model.encode(
         [search_query],
-        prompt="Retrieve images relevant to the user's query.",
+        prompt=DASHCAM_RETRIEVAL_PROMPT,
         convert_to_numpy=True,
         normalize_embeddings=True,
     ).astype("float32")
@@ -971,7 +974,7 @@ def rerank_search_results(
     scores = reranker.predict(
         pairs,
         batch_size=batch_size,
-        prompt=RERANKER_PROMPT,
+        prompt=DASHCAM_RETRIEVAL_PROMPT,
         show_progress_bar=len(pairs) > batch_size,
     )
     for result, score in zip(pair_results, scores):
