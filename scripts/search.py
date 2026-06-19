@@ -43,6 +43,27 @@ DASHCAM_RETRIEVAL_PROMPT = (
     "Retrieve dashcam images that visually show the road scene, traffic participant, "
     "dangerous behavior, collision, or near-miss event described in the user's query."
 )
+DASHCAM_RERANKER_PROMPT = (
+    "Retrieve dashcam images that exactly match all visible facts in the user query. "
+    "Pay special attention to traffic direction, lane position, participant orientation, "
+    "and relative motion. For wrong-way traffic, require visible evidence that the "
+    "participant is moving against the expected traffic flow; do not treat same-direction "
+    "traffic as relevant."
+)
+WRONG_WAY_BICYCLE_QUERY = (
+    "A wrong-way cyclist facing and riding toward the dashcam against the direction "
+    "of motor traffic."
+)
+SIMPLE_WRONG_WAY_BICYCLE_PATTERNS = (
+    re.compile(
+        r"^(?:自転車|サイクリスト|チャリ)(?:が|は|の)?"
+        r"(?:(?:道路|車道)(?:を|で)?)?逆走(?:している|してる|する|中)?[。.!！]?$"
+    ),
+    re.compile(
+        r"^逆走(?:している|してる|する|中)?(?:の)?"
+        r"(?:自転車|サイクリスト|チャリ)[。.!！]?$"
+    ),
+)
 
 
 @dataclass
@@ -173,6 +194,20 @@ def clean_yes_no(text: str) -> str:
         return "No"
 
     raise RuntimeError(f"Ollama の画像検索要否判定が Yes/No ではありませんでした: {text!r}")
+
+
+def build_reranker_query(search_query: str) -> str:
+    """
+    Qwen3-VL-Reranker は短い日本語の「自転車が逆走している」では、
+    自転車の有無を進行方向より強く評価することがある。
+    単純な逆走自転車クエリだけ、視覚的に判定できる英語表現へ正規化する。
+    """
+    normalized_query = re.sub(r"\s+", "", search_query)
+
+    if any(pattern.fullmatch(normalized_query) for pattern in SIMPLE_WRONG_WAY_BICYCLE_PATTERNS):
+        return WRONG_WAY_BICYCLE_QUERY
+
+    return search_query
 
 
 def split_think_tags(content: str, thinking: str) -> OllamaChatResult:
@@ -974,7 +1009,7 @@ def rerank_search_results(
     scores = reranker.predict(
         pairs,
         batch_size=batch_size,
-        prompt=DASHCAM_RETRIEVAL_PROMPT,
+        prompt=DASHCAM_RERANKER_PROMPT,
         show_progress_bar=len(pairs) > batch_size,
     )
     for result, score in zip(pair_results, scores):
@@ -1416,14 +1451,17 @@ def main():
             )
 
         if args.rerank_candidates > 0:
+            reranker_query = build_reranker_query(search_query)
             ranked_results = rerank_search_results(
                 ranked_results,
                 image_paths,
-                search_query,
+                reranker_query,
                 reranker=load_reranker(),
                 candidate_count=args.rerank_candidates,
                 batch_size=args.reranker_batch_size,
             )
+        else:
+            reranker_query = None
 
         top_results = ranked_results[: args.top_k]
         bottom_results = [] if args.bottom_k == 0 else ranked_results[-args.bottom_k :]
@@ -1432,9 +1470,14 @@ def main():
         # 後方互換のため、query.txt には実際に検索へ使ったクエリを保存する。
         with open(result_dir / "query.txt", "w", encoding="utf-8") as f:
             f.write(search_query + "\n")
+        if reranker_query is not None:
+            with open(result_dir / "reranker_query.txt", "w", encoding="utf-8") as f:
+                f.write(reranker_query + "\n")
 
         print(f"search mode: {args.mode}")
         print(f"search query: {search_query}")
+        if reranker_query is not None and reranker_query != search_query:
+            print(f"reranker query: {reranker_query}")
         print(f"results: {result_dir}")
         print()
 
