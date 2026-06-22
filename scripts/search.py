@@ -20,7 +20,9 @@ except ImportError:
 
 
 MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
-RERANKER_MODEL_NAME = "Qwen/Qwen3-VL-Reranker-2B"
+RERANKER_MODEL_NAME = "Qwen/Qwen3-VL-Reranker-8B"
+EMBEDDING_DEVICE = "cpu"
+RERANKER_DEVICE = "cuda:0"
 OLLAMA_MODEL_NAME = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300.0
@@ -51,8 +53,7 @@ DASHCAM_RERANKER_PROMPT = (
     "traffic as relevant."
 )
 WRONG_WAY_BICYCLE_QUERY = (
-    "A wrong-way cyclist facing and riding toward the dashcam against the direction "
-    "of motor traffic."
+    "自転車が逆走している"
 )
 SIMPLE_WRONG_WAY_BICYCLE_PATTERNS = (
     re.compile(
@@ -1098,7 +1099,7 @@ def main():
         type=int,
         default=RERANK_CANDIDATES,
         help=(
-            "Qwen3-VL-Reranker-2B で再ランキングする初段検索の上位件数。"
+            "Qwen3-VL-Reranker-8B で再ランキングする初段検索の上位件数。"
             f"0 で無効。デフォルト: {RERANK_CANDIDATES}"
         ),
     )
@@ -1106,6 +1107,16 @@ def main():
         "--reranker-model",
         default=RERANKER_MODEL_NAME,
         help=f"再ランキングに使うモデル。デフォルト: {RERANKER_MODEL_NAME}",
+    )
+    parser.add_argument(
+        "--embedding-device",
+        default=EMBEDDING_DEVICE,
+        help=f"Embeddingモデルをロードするデバイス。デフォルト: {EMBEDDING_DEVICE}",
+    )
+    parser.add_argument(
+        "--reranker-device",
+        default=RERANKER_DEVICE,
+        help=f"RerankerモデルをロードするGPUデバイス。デフォルト: {RERANKER_DEVICE}",
     )
     parser.add_argument(
         "--reranker-batch-size",
@@ -1240,7 +1251,7 @@ def main():
         if model is None:
             from sentence_transformers import SentenceTransformer
 
-            model = SentenceTransformer(MODEL_NAME)
+            model = SentenceTransformer(MODEL_NAME, device=args.embedding_device)
 
         return model
 
@@ -1249,8 +1260,44 @@ def main():
 
         if reranker is None:
             from sentence_transformers import CrossEncoder
+            from sentence_transformers.cross_encoder.modules import LogitScore, Transformer
+            from transformers import BitsAndBytesConfig
 
-            reranker = CrossEncoder(args.reranker_model)
+            model_kwargs = {
+                "device_map": {"": args.reranker_device},
+                "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
+            }
+
+            # Qwen3-VL-Reranker の現行リポジトリは modules.json が参照する
+            # 1_CausalScoreHead の設定ファイルを含まないため、スコアリング
+            # モジュールを明示的に組み立てる。
+            transformer = Transformer.load(
+                args.reranker_model,
+                model_kwargs=model_kwargs,
+            )
+            true_token_id = transformer.tokenizer.convert_tokens_to_ids("yes")
+            false_token_id = transformer.tokenizer.convert_tokens_to_ids("no")
+            if true_token_id is None or false_token_id is None:
+                raise RuntimeError(
+                    "再ランカーのトークナイザにスコア計算用の yes/no トークンがありません。"
+                )
+
+            class DeviceMappedCrossEncoder(CrossEncoder):
+                def to(self, *args, **kwargs):
+                    # device_map による配置を CrossEncoder 側から変更しない。
+                    return self
+
+            reranker = DeviceMappedCrossEncoder(
+                modules=[
+                    transformer,
+                    LogitScore(
+                        true_token_id=true_token_id,
+                        false_token_id=false_token_id,
+                    ),
+                ],
+                prompts={"query": "Retrieve text relevant to the user's query."},
+                default_prompt_name="query",
+            )
 
         return reranker
 
