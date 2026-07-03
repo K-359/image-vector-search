@@ -25,7 +25,7 @@ except ImportError:
             print(message)
 
 
-OLLAMA_MODEL_NAME = "qwen3.5:9b"
+OLLAMA_MODEL_NAME = "gemma4:12b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300.0
 DATA_DIR = Path("data")
