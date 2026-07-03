@@ -1,7 +1,5 @@
 .vscode/
 __pycache__/
-images/
-data/
-images_old/
-data_old/
+images*/
+data*/
 results/
