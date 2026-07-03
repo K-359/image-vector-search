@@ -176,7 +176,9 @@ python scripts/generate_captions.py --continue-on-error
 `scripts/search.py --mode caption` は `data/image_captions.jsonl` を読み込み、初回実行時にキャプション埋め込みの FAISS インデックスを `data/caption_embeddings.faiss` に作成します。
 `data/image_captions.jsonl` の末尾にキャプションが追加された場合は、追加分だけを `data/caption_embeddings.faiss` に追記します。
 既存のメタデータと整合しない変更がある場合は自動で作り直します。
-初回インデックス作成は Ollama の検索要否判定モデルを呼ぶ前に実行されるため、埋め込みモデルと Ollama 側の LLM が同時にバッチ生成メモリを使う状態を避けます。
+初回インデックス作成は Reranker や Ollama の検索要否判定モデルを呼ぶ前に実行されます。
+このときだけ `--caption-index-embedding-device auto` により、利用可能なら `--reranker-device` と同じGPUでキャプション埋め込みを生成します。
+生成後はEmbeddingモデルを解放してからRerankerをロードし、その後の検索クエリの埋め込みはデフォルトでCPU推論します。
 
 ## テキストで画像を検索する
 
@@ -199,8 +201,9 @@ python scripts/search.py "赤い車が雪道を走っている" --mode caption
 
 どちらのモードも、初段検索の上位50件をデフォルトで Qwen3-VL-Reranker-8B に渡します。
 再ランカーは bitsandbytes の8bit量子化を使い、デフォルトでは全体を `cuda:0` にロードします。
-VRAMを再ランカーへ優先配分するため、EmbeddingモデルはデフォルトでCPUへロードします。
-配置先は `--embedding-device` と `--reranker-device` で変更できます。
+VRAMを再ランカーへ優先配分するため、検索クエリ用EmbeddingモデルはデフォルトでCPUへロードします。
+`caption` モードのインデックス作成/追記時だけ、デフォルトでは利用可能な `--reranker-device` を使ってGPU推論します。
+配置先は `--embedding-device`, `--caption-index-embedding-device`, `--reranker-device` で変更できます。
 `image` モードでは画像、`caption` モードでは画像とキャプションを組み合わせて再ランキングします。
 短い逆走自転車クエリは、再ランカーが進行方向を判定しやすい英語の視覚条件へ正規化します。
 初段検索には元のクエリを使い、正規化後のクエリは結果ディレクトリの

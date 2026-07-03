@@ -1,5 +1,6 @@
 import argparse
 import base64
+import gc
 import hashlib
 import json
 import math
@@ -22,6 +23,7 @@ except ImportError:
 MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
 RERANKER_MODEL_NAME = "Qwen/Qwen3-VL-Reranker-8B"
 EMBEDDING_DEVICE = "cpu"
+CAPTION_INDEX_EMBEDDING_DEVICE = "auto"
 RERANKER_DEVICE = "cuda:0"
 OLLAMA_MODEL_NAME = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -671,6 +673,66 @@ def load_caption_records(path: Path) -> list[CaptionRecord]:
     return records
 
 
+def release_accelerator_memory():
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
+
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        xpu.empty_cache()
+
+    mps = getattr(torch, "mps", None)
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps is not None and mps_backend is not None and mps_backend.is_available():
+        mps.empty_cache()
+
+
+def accelerator_device_is_available(device: str) -> bool:
+    if device == "cpu":
+        return True
+
+    try:
+        import torch
+    except ImportError:
+        return False
+
+    if device.startswith("cuda"):
+        return torch.cuda.is_available()
+    if device.startswith("mps"):
+        mps_backend = getattr(torch.backends, "mps", None)
+        return mps_backend is not None and mps_backend.is_available()
+    if device.startswith("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        return xpu is not None and xpu.is_available()
+
+    return True
+
+
+def resolve_caption_index_embedding_device(
+    *,
+    caption_index_embedding_device: str,
+    embedding_device: str,
+    reranker_device: str,
+) -> str:
+    if caption_index_embedding_device != "auto":
+        return caption_index_embedding_device
+
+    if accelerator_device_is_available(reranker_device):
+        return reranker_device
+
+    return embedding_device
+
+
 def caption_index_metadata(captions_path: Path, records: list[CaptionRecord]) -> dict:
     stat = captions_path.stat()
     return {
@@ -844,7 +906,7 @@ def load_or_build_caption_vector_index(
     records: list[CaptionRecord],
     *,
     captions_path: Path,
-    model,
+    model_loader,
     index_path: Path,
     meta_path: Path,
     batch_size: int,
@@ -876,7 +938,7 @@ def load_or_build_caption_vector_index(
                 index,
                 records,
                 start_index=append_start,
-                model=model,
+                model=model_loader(),
                 batch_size=batch_size,
             )
             faiss.write_index(index, str(index_path))
@@ -888,7 +950,7 @@ def load_or_build_caption_vector_index(
     print(f"caption vector index を作成します: {index_path}")
     return build_caption_vector_index(
         records,
-        model=model,
+        model=model_loader(),
         index_path=index_path,
         meta_path=meta_path,
         metadata=metadata,
@@ -1111,7 +1173,16 @@ def main():
     parser.add_argument(
         "--embedding-device",
         default=EMBEDDING_DEVICE,
-        help=f"Embeddingモデルをロードするデバイス。デフォルト: {EMBEDDING_DEVICE}",
+        help=f"検索クエリ用Embeddingモデルをロードするデバイス。デフォルト: {EMBEDDING_DEVICE}",
+    )
+    parser.add_argument(
+        "--caption-index-embedding-device",
+        default=CAPTION_INDEX_EMBEDDING_DEVICE,
+        help=(
+            "caption モードのインデックス作成/追記だけに使うEmbeddingモデルのデバイス。"
+            "auto は reranker-device が利用可能ならそれを使い、不可なら embedding-device を使う。"
+            f"デフォルト: {CAPTION_INDEX_EMBEDDING_DEVICE}"
+        ),
     )
     parser.add_argument(
         "--reranker-device",
@@ -1255,10 +1326,21 @@ def main():
 
         return model
 
+    def unload_embedding_model():
+        nonlocal model
+
+        if model is None:
+            return
+
+        model = None
+        release_accelerator_memory()
+
     def load_reranker():
         nonlocal reranker
 
         if reranker is None:
+            unload_embedding_model()
+
             from sentence_transformers import CrossEncoder
             from sentence_transformers.cross_encoder.modules import LogitScore, Transformer
             from transformers import BitsAndBytesConfig
@@ -1309,14 +1391,15 @@ def main():
 
         return image_dates
 
-    def load_image_search_backend():
+    def load_image_search_backend(*, load_query_embedding_model: bool = True):
         nonlocal image_index, image_paths
 
         index_path = DATA_DIR / "images.faiss"
         paths_path = DATA_DIR / "image_paths.json"
 
         if image_index is not None and image_paths is not None:
-            return image_index, image_paths, load_image_dates_once(), load_embedding_model()
+            embedding_model = load_embedding_model() if load_query_embedding_model else None
+            return image_index, image_paths, load_image_dates_once(), embedding_model
 
         if not index_path.exists():
             raise FileNotFoundError(f"{index_path} がありません。先に scripts/build_index.py を実行してください。")
@@ -1330,37 +1413,77 @@ def main():
         with open(paths_path, "r", encoding="utf-8") as f:
             image_paths = json.load(f)
 
-        return image_index, image_paths, load_image_dates_once(), load_embedding_model()
+        embedding_model = load_embedding_model() if load_query_embedding_model else None
+        return image_index, image_paths, load_image_dates_once(), embedding_model
 
-    def load_caption_search_backend():
+    def load_caption_search_backend(*, load_query_embedding_model: bool = True):
         nonlocal caption_index, caption_records, caption_bm25_index
 
         if caption_index is not None and caption_records is not None and caption_bm25_index is not None:
             caption_paths = [record.image_path for record in caption_records]
+            embedding_model = load_embedding_model() if load_query_embedding_model else None
             return (
                 caption_index,
                 caption_records,
                 caption_paths,
                 load_image_dates_once(),
-                load_embedding_model(),
+                embedding_model,
                 caption_bm25_index,
             )
 
         loaded_records = load_caption_records(args.captions_jsonl)
-        embedding_model = load_embedding_model()
-        caption_index = load_or_build_caption_vector_index(
-            loaded_records,
-            captions_path=args.captions_jsonl,
-            model=embedding_model,
-            index_path=CAPTION_INDEX_PATH,
-            meta_path=CAPTION_INDEX_META_PATH,
-            batch_size=args.caption_batch_size,
+
+        caption_index_embedding_model = None
+        caption_index_embedding_device = resolve_caption_index_embedding_device(
+            caption_index_embedding_device=args.caption_index_embedding_device,
+            embedding_device=args.embedding_device,
+            reranker_device=args.reranker_device,
         )
+
+        def load_caption_index_embedding_model():
+            nonlocal caption_index_embedding_model
+
+            if caption_index_embedding_model is None:
+                from sentence_transformers import SentenceTransformer
+
+                print(
+                    "caption vector index の埋め込み生成デバイス: "
+                    f"{caption_index_embedding_device}"
+                )
+                caption_index_embedding_model = SentenceTransformer(
+                    MODEL_NAME,
+                    device=caption_index_embedding_device,
+                )
+
+            return caption_index_embedding_model
+
+        def unload_caption_index_embedding_model():
+            nonlocal caption_index_embedding_model
+
+            if caption_index_embedding_model is None:
+                return
+
+            caption_index_embedding_model = None
+            release_accelerator_memory()
+
+        try:
+            caption_index = load_or_build_caption_vector_index(
+                loaded_records,
+                captions_path=args.captions_jsonl,
+                model_loader=load_caption_index_embedding_model,
+                index_path=CAPTION_INDEX_PATH,
+                meta_path=CAPTION_INDEX_META_PATH,
+                batch_size=args.caption_batch_size,
+            )
+        finally:
+            unload_caption_index_embedding_model()
+
         caption_records = loaded_records
         caption_bm25_index = BM25Index(
             [tokenize_for_bm25(record.caption) for record in caption_records]
         )
         caption_paths = [record.image_path for record in caption_records]
+        embedding_model = load_embedding_model() if load_query_embedding_model else None
 
         return (
             caption_index,
@@ -1373,16 +1496,16 @@ def main():
 
     if args.interactive:
         if args.mode == "image":
-            load_image_search_backend()
+            load_image_search_backend(load_query_embedding_model=False)
         else:
-            load_caption_search_backend()
+            load_caption_search_backend(load_query_embedding_model=False)
         if args.rerank_candidates > 0:
             load_reranker()
         print("検索文を入力してください。終了するには空行または Ctrl-D を入力してください。")
     elif args.mode == "caption":
         # 初回のキャプション埋め込み生成はメモリを多く使うため、
         # Reranker と Ollama の判定/回答用モデルをロードする前に済ませる。
-        load_caption_search_backend()
+        load_caption_search_backend(load_query_embedding_model=False)
         if args.rerank_candidates > 0:
             load_reranker()
 
