@@ -7,3 +7,5 @@ faiss-cpu
 pillow
 numpy
 tqdm
+peft
+scikit-learn

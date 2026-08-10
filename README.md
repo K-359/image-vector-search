@@ -25,11 +25,28 @@ Qwen3-VL-Embedding-2B を使って、画像とテキストを同じ埋め込み�
 │       ├── query.txt
 │       ├── 01_0.8123_sample001.jpg
 │       └── ...
+├── datasets/
+│   └── dashcam_reranker_ft_v1/
+│       ├── manifests/sampled_images.jsonl
+│       ├── raw_teacher/scene_cards.jsonl
+│       ├── derived/queries.jsonl
+│       ├── pairs.train.jsonl
+│       ├── pairs.val.jsonl
+│       ├── pairs.test.jsonl
+│       └── reports/
+├── models/
+│   └── qwen3-vl-reranker-8b-dashcam-v1/
+│       ├── adapter_config.json
+│       └── adapter_model.safetensors
 ├── scripts/
 │   ├── build_index.py
 │   ├── generate_captions.py
 │   ├── generate_image_dates.py
-│   └── search.py
+│   ├── search.py
+│   ├── reranker_common.py
+│   ├── build_reranker_dataset.py
+│   ├── train_reranker_qlora.py
+│   └── evaluate_reranker.py
 ├── requirements.txt
 └── README.md
 ```
@@ -397,6 +414,207 @@ python scripts/build_index.py --rebuild
 ```bash
 python scripts/generate_captions.py
 ```
+
+## Reranker をドライブレコーダ画像に特化させる
+
+`Qwen3-VL-Reranker-8B` を BDD100k のドライブレコーダ画像で QLoRA ファインチューニングし、
+学習前後の精度を定量比較する一連のスクリプトです。
+
+```text
+scripts/build_reranker_dataset.py   学習・評価データセットを作る
+scripts/train_reranker_qlora.py     QLoRA で学習する
+scripts/evaluate_reranker.py        学習前後の精度を比較する
+scripts/reranker_common.py          3つのスクリプトが共有するモデル読み込みとスコア計算
+```
+
+3つのスクリプトは `scripts/reranker_common.py` を通して、本番検索 `scripts/search.py` と
+同じ命令文 (`DASHCAM_RERANKER_PROMPT`)、同じクエリ正規化、同じスコア計算
+(`logit("yes") - logit("no")`) を使います。
+学習・評価・本番で入力の作り方が一致するため、評価で測った差がそのまま検索の差になります。
+
+### 1. データセットを作る
+
+Ollama の教師モデルで、画像1枚ごとに「シーンカード」を生成します。
+シーンカードは、画像に写っている事実を決められた語彙で構造化したものと、
+その画像を検索するための日本語クエリを含みます。
+
+```bash
+python scripts/build_reranker_dataset.py --num-images 1000
+```
+
+デフォルトでは `images_100k/` から 1000 枚を決定的にサンプリングし、
+`hf.co/unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q3_K_XL` でラベリングして
+`datasets/dashcam_reranker_ft_v1/` へ書き出します。
+RTX 4070 Ti SUPER (16GB) では1枚あたり20〜40秒、1000枚で6〜11時間程度かかります。
+1件ずつ追記保存し、既にカードがある画像は自動でスキップするため、途中で止めても同じコマンドで再開できます。
+
+VRAM 16GB では教師モデルのコンテキスト長 4096 が上限の目安です。
+`CUDA error: out of memory` が出る場合は下げてください。
+
+```bash
+python scripts/build_reranker_dataset.py --num-images 1000 --num-ctx 2048
+```
+
+ラベリング済みのカードからペアだけ作り直す場合は、Ollama を呼ばない `pairs` ステージを実行します。
+
+```bash
+python scripts/build_reranker_dataset.py --stage pairs
+```
+
+#### ラベルの付き方
+
+クエリの制約をすべて満たす画像が正例 (label=1)、満たさない画像が負例 (label=0) です。
+判定は構造化された事実集合に対する決定的な照合で行うため、同じシーンカードからは常に同じラベルが再現されます。
+
+制約は「シーン条件」と「対象物条件」に分かれます。
+対象物条件は、クエリが言及している対象物ごとに画像内の対象物へ重複なく割り当てられるかを見ます。
+これにより「右車線に車、左車線に別の車」のような組み合わせ条件を、対象物単位で正しく判定できます。
+
+負例は2種類です。
+
+- `hard_negative`: 制約の一部だけを満たす画像。満たした割合が高いものを優先して選ぶ
+- `random_negative`: 制約をひとつも満たさない画像
+
+#### ラベルを絞り込むオプション (既定は無効)
+
+既定では教師モデルの出力をそのままラベル判定に使います。
+まずこの素の状態で学習・評価し、誤りを見てから絞り込みを検討してください。
+
+教師モデルは、クエリ文が述べていない条件まで制約に書き込むことがあります
+(例:「自車の前方を走行している車」に `time_of_day=day` が付き、夜の該当画像が負例になる)。
+これが誤ラベルとして効いていると分かった場合は `--ground-constraints` で、
+クエリ文に対応する日本語表現が現れない条件を落とせます。
+ただしこの判定は手書きのキーワード表で行うため、それ自体が誤差源になります
+(「金色」を `yellow` に結び付けられない、など)。
+
+`motion` は静止画1枚では「停止中」と「駐車中」を区別できず、
+教師が同じ状況へ違うラベルを付けることがあります。
+`--drop-motion-constraints` でラベル判定から外せます。
+
+```bash
+python scripts/build_reranker_dataset.py --stage pairs --ground-constraints --drop-motion-constraints
+```
+
+`pairs` ステージは数秒で終わり、シーンカードを作り直す必要はありません。
+出力先を変えて両方の設定でデータセットを作れば、どちらが良いかを評価コードで実測できます。
+
+```bash
+python scripts/build_reranker_dataset.py --stage pairs \
+  --dataset-dir datasets/dashcam_reranker_ft_v1_grounded \
+  --scene-cards datasets/dashcam_reranker_ft_v1/raw_teacher/scene_cards.jsonl \
+  --ground-constraints --drop-motion-constraints
+```
+
+`--scene-cards` で既存のラベリング結果を再利用するため、教師モデルを呼び直す必要はありません。
+
+#### 分割
+
+train / val / test は画像単位で分割します (既定 0.7 / 0.1 / 0.2)。
+クエリは生成元画像の分割に属し、候補画像も同じ分割のプールからのみ選ぶため、
+画像もクエリも分割をまたぎません。
+リークがないことは `reports/split_isolation.json` に記録され、検出した場合はエラーで停止します。
+
+生成物:
+
+```text
+datasets/dashcam_reranker_ft_v1/
+├── manifests/sampled_images.jsonl      サンプリングした画像の一覧
+├── raw_teacher/scene_cards.jsonl       教師モデルの出力 (再開の基準)
+├── raw_teacher/scene_card_errors.jsonl 失敗した画像
+├── derived/queries.jsonl               採用したクエリと制約
+├── pairs.train.jsonl
+├── pairs.val.jsonl
+├── pairs.test.jsonl
+└── reports/
+    ├── dataset_stats.json              件数・正例率・難易度の内訳
+    ├── split_isolation.json            分割間のリーク検査結果
+    └── fact_coverage.json              事実の出現頻度
+```
+
+### 2. QLoRA で学習する
+
+学習の前に、教師モデルを VRAM から降ろしてください。
+Ollama はリクエスト後もしばらくモデルを保持するため、16GB では Reranker のロードが
+`CUDA error: out of memory` で失敗します。
+
+```bash
+curl -s http://localhost:11434/api/chat -d '{"model":"hf.co/unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q3_K_XL","messages":[],"keep_alive":0}'
+```
+
+```bash
+python scripts/train_reranker_qlora.py
+```
+
+bitsandbytes の 4bit NF4 でベースモデルを量子化し、LLM 側の線形層へ LoRA を入れます。
+損失は、本番と同じスコア `logit("yes") - logit("no")` を logit とみなした二値交差エントロピーです。
+視覚エンコーダと merger は既定で凍結します。データ量が少ないうちは LLM 側だけで十分です。
+
+エポックごとに val を評価し、nDCG@5 が最良のアダプタを `--output-dir` の直下へ保存します。
+最終エポックのアダプタは `last/` に残ります。
+
+VRAM が足りない場合は画像の解像度を下げます (既定はモデルの `preprocessor_config.json` の値)。
+
+```bash
+python scripts/train_reranker_qlora.py --max-pixels 401408 --batch-size 1
+```
+
+主なオプション:
+
+```bash
+# Qwen 公式の LoRA 設定 (既定)
+python scripts/train_reranker_qlora.py --lora-rank 32 --lora-alpha 32
+
+# ms-swift のサンプルに合わせた軽い設定
+python scripts/train_reranker_qlora.py --lora-rank 8 --lora-alpha 32 --target-modules all-linear
+
+# 視覚エンコーダにも LoRA を入れる
+python scripts/train_reranker_qlora.py --train-vision-tower
+
+# 数十ペアだけで配線を確認する
+python scripts/train_reranker_qlora.py --max-train-pairs 16 --max-val-pairs 8 --epochs 1
+```
+
+### 3. 学習前後の精度を比較する
+
+```bash
+python scripts/evaluate_reranker.py
+```
+
+同じプロセス内で1つのモデルをロードし、LoRA アダプタを無効にした状態 (base) と
+有効にした状態 (adapter) の両方で test を採点します。
+量子化・画像解像度・命令文・クエリ正規化がすべて共通なので、差分をモデルの変化だけに帰属できます。
+
+出力する指標:
+
+- ランキング: nDCG@1 / @3 / @5 / @10、MRR、MAP、Recall@1 / @3 / @5
+- 二値識別: ROC-AUC、PR-AUC、スコア0を閾値とした正解率・適合率・再現率
+- `hard_negative_error_rate`: 正例より高いスコアが付いた hard negative の割合
+
+base と adapter の差は、クエリ単位のペアード・ブートストラップで 95% 信頼区間と p 値を出します。
+信頼区間が 0 をまたぐ場合、その差は統計的に有意ではありません。
+
+学習前のベースラインだけを測る場合:
+
+```bash
+python scripts/evaluate_reranker.py --no-adapter
+```
+
+`--quantization` は既定で本番検索と同じ 8bit です。base と adapter は必ず同じ設定で測ります。
+
+結果は `datasets/dashcam_reranker_ft_v1/reports/` へ保存されます。
+
+```text
+eval_test_20260810_153012.md      比較表と判定
+eval_test_20260810_153012.json    全指標とブートストラップ統計
+scores_test_20260810_153012.jsonl ペアごとの base / adapter スコア
+```
+
+`scores_*.jsonl` を見ると、どのクエリでどの画像の順位が入れ替わったかを個別に確認できます。
+
+### 4. 学習したアダプタを検索で使う
+
+`scripts/search.py` は現時点ではベースモデルだけを読み込みます。
+アダプタを本番検索へ入れる場合は、Reranker のロード後に `load_adapter` を呼んでください。
 
 ## よく使うコマンド
 
