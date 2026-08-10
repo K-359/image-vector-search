@@ -13,6 +13,9 @@ Transformer + LogitScore を組み合わせてこのスコアを計算してい�
     score = logit("yes") - logit("no")
     loss  = BCEWithLogits(score, label)
 
+pos_weight=1.0 (既定) のとき、この損失は Qwen 公式の
+「正例なら yes、負例なら no を出す非加重 NLL」と数学的に等価である。
+
 LoRA は transformers の PEFT 統合 (add_adapter) でモデル内部へ直接注入する。
 モデルを PeftModel でラップしないため、sentence-transformers 側の forward 経路は変わらない。
 ViT (vision tower) と merger は既定で凍結し、LLM 側の線形層だけを学習する。
@@ -57,10 +60,13 @@ DEFAULT_DATASET_DIR = "datasets/dashcam_reranker_ft_v1"
 DEFAULT_OUTPUT_DIR = "models/qwen3-vl-reranker-8b-dashcam-v1"
 ADAPTER_NAME = "dashcam"
 
-# Qwen 公式の Qwen3-VL-Reranker 向け LoRA 設定に合わせた既定値。
+# Qwen 公式が公開している LoRA 設定は rank=32 / alpha=32 で、対象は
+# q_proj v_proj k_proj up_proj down_proj gate_proj の6つ。
+# ここでは o_proj も加えている (attention 出力側も適応させるため) ので、公式と完全に同じではない。
+# 公式に厳密に合わせるなら --target-modules q_proj k_proj v_proj gate_proj up_proj down_proj を渡す。
 DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-# LoRA を LLM 側だけに入れるため、視覚側モジュール名を除外する。
+# LoRA を LLM 側だけに入れるため、視覚側モジュール名を除外する (--train-vision-tower で解除)。
 VISION_MODULE_KEYWORDS = ("visual", "vision", "merger", "deepstack")
 
 
@@ -113,8 +119,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pos-weight",
         type=float,
-        default=None,
-        help="正例の重み。既定は train の負例数/正例数から自動計算する。",
+        default=1.0,
+        help=(
+            "BCE の正例重み。既定の 1.0 は Qwen 公式の非加重 yes/no 損失と数学的に等価。"
+            " 0 を指定すると train の 負例数/正例数 から自動計算する (クラス不均衡補正の実験用)。"
+        ),
     )
     parser.add_argument(
         "--no-gradient-checkpointing",
@@ -368,6 +377,14 @@ def main() -> None:
     output_dir = (PROJECT_ROOT / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 前回の実行で書かれた best アダプタが残っていると、今回 best を1度も更新しなかった場合に
+    # 古いアダプタを今回の結果と取り違える。実行開始時に必ず消しておく。
+    for stale in ("adapter_config.json", "adapter_model.safetensors", "adapter_metrics.json"):
+        path = output_dir / stale
+        if path.exists():
+            print(f"前回の best アダプタを削除します: {path.name}")
+            path.unlink()
+
     train_pairs = load_pairs(dataset_dir / "pairs.train.jsonl")
     val_pairs = load_pairs(dataset_dir / "pairs.val.jsonl")
     if not train_pairs:
@@ -384,7 +401,7 @@ def main() -> None:
     print(f"val:   {len(val_pairs)} ペア")
 
     pos_weight_value = args.pos_weight
-    if pos_weight_value is None:
+    if pos_weight_value <= 0:
         pos_weight_value = negatives / positives if positives else 1.0
     pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32)
     print(f"pos_weight: {pos_weight_value:.3f}")
@@ -479,6 +496,8 @@ def main() -> None:
         return adapter_dir
 
     best_metric = -float("inf")
+    baseline_metric: float | None = None
+    best_saved = False
     micro_step = 0
     optimizer_step = 0
     accumulated_loss = 0.0
@@ -499,9 +518,12 @@ def main() -> None:
             pos_weight=pos_weight,
         )
         # 学習開始前の val はアダプタ初期値 (LoRA B=0) なのでベースモデルと同じ。
+        # この値を best の下限にする。これを超えないチェックポイントは、
+        # ベースモデルより悪いので best として保存しない。
         print(f"[step 0] val(base): {json.dumps(baseline, ensure_ascii=False)}")
         history.append({"optimizer_step": 0, "val": baseline})
         best_metric = baseline["ndcg@5"]
+        baseline_metric = baseline["ndcg@5"]
 
     total_epochs = int(math.ceil(args.epochs))
     stop = False
@@ -575,6 +597,7 @@ def main() -> None:
                     if metrics["ndcg@5"] > best_metric:
                         best_metric = metrics["ndcg@5"]
                         save_adapter("best", metrics)
+                        best_saved = True
                         print(f"  -> best を更新しました (nDCG@5={best_metric:.4f})")
 
         if val_pairs and not stop:
@@ -590,6 +613,7 @@ def main() -> None:
             if metrics["ndcg@5"] > best_metric:
                 best_metric = metrics["ndcg@5"]
                 save_adapter("best", metrics)
+                best_saved = True
                 print(f"  -> best を更新しました (nDCG@5={best_metric:.4f})")
 
     final_metrics = (
@@ -603,22 +627,40 @@ def main() -> None:
         if val_pairs
         else {}
     )
-    save_adapter("last", final_metrics)
-    if not (output_dir / "adapter_config.json").exists():
-        # val 評価で一度も best を更新しなかった場合でも、直下にアダプタを残す。
+    last_dir = save_adapter("last", final_metrics)
+
+    if not val_pairs:
+        # val がなければ選びようがないので、最終アダプタをそのまま直下へ置く。
         save_adapter("best", final_metrics)
+        best_saved = True
 
     write_json(
         output_dir / "train_history.json",
         {
             "history": history,
+            "baseline_val_ndcg@5": baseline_metric,
             "best_val_ndcg@5": best_metric,
+            "best_checkpoint_saved": best_saved,
             "final_val": final_metrics,
             "elapsed_seconds": round(time.monotonic() - started_at, 1),
         },
     )
-    print(f"学習完了。アダプタ: {output_dir}")
+
     print(f"最終 val: {json.dumps(final_metrics, ensure_ascii=False)}")
+    if best_saved:
+        print(f"学習完了。best アダプタ: {output_dir} (val nDCG@5={best_metric:.4f})")
+        print(f"最終エポックのアダプタ: {last_dir}")
+    else:
+        # ベースライン以下のアダプタを best として置くと、評価スクリプトが
+        # 「学習で改善した」ように見える出力を作ってしまう。あえて何も置かない。
+        print(
+            f"学習完了。ただし val nDCG@5 が学習前 ({baseline_metric:.4f}) を一度も超えませんでした。"
+        )
+        print(f"best アダプタは保存していません。最終エポックのアダプタ: {last_dir}")
+        print(
+            "そのまま評価する場合は --adapter-path に上記の last/ を指定してください"
+            " (学習前より悪い可能性があります)。"
+        )
 
 
 if __name__ == "__main__":

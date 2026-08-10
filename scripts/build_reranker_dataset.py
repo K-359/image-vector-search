@@ -14,8 +14,10 @@ Qwen3-VL-Reranker-8B のドライブレコーダ特化ファインチューニ�
 ラベルは教師モデルの自由記述ではなく、構造化された事実集合に対する決定的な判定で付く。
 そのため同じシーンカードからは常に同じラベルが再現され、学習前後の比較が安定する。
 
-train / val / test は「画像単位」で分割する。クエリはその生成元画像の分割に属し、
-候補画像も同じ分割のプールからのみ選ぶ。これにより画像もクエリも分割をまたがない。
+train / val / test は「動画グループ単位」で分割する。BDD100k のファイル名は
+<動画ID>-<フレームID> なので、同じ動画から切り出された別フレームは必ず同じ分割へ入る。
+クエリはその生成元画像の分割に属し、候補画像も同じ分割のプールからのみ選ぶ。
+これにより画像もクエリも、ほぼ同一の景色も、分割をまたがない。
 
 使い方:
 
@@ -861,6 +863,20 @@ def image_id_for(path: Path) -> str:
     return f"bdd100k:{path.stem}"
 
 
+def group_id_for(image_id: str) -> str:
+    """
+    同じ動画から切り出されたと考えられる画像をまとめるキー。
+
+    BDD100k のファイル名は <動画ID>-<フレームID>.jpg で、
+    images_100k の 100,003 枚は 60,141 個の動画IDしか持たない。
+    つまり同じ動画の別フレームが多数含まれる (最大 48 枚)。
+    これらを別々の分割へ入れると、ほぼ同じ景色が train と test の両方に現れ、
+    学習前後の差を過大評価してしまう。分割は動画ID単位で行う。
+    """
+
+    return image_id.split(":")[-1].split("-")[0]
+
+
 def acquire_cards_lock(dataset_dir: Path) -> Path:
     """
     同じデータセットへ cards ステージを二重に走らせないためのロック。
@@ -1008,25 +1024,35 @@ def normalize_query_text(text: str) -> str:
 def assign_splits(
     cards: list[dict[str, Any]], ratios: tuple[float, float, float], seed: int
 ) -> dict[str, str]:
-    """画像単位で train / val / test を割り当てる。"""
+    """
+    動画グループ単位で train / val / test を割り当てる。
 
-    image_ids = sorted(card["image_id"] for card in cards)
+    同じ動画の別フレームは必ず同じ分割へ入る。
+    グループはシャッフル後、目標枚数に対して最も不足している分割へ順に詰める。
+    """
+
+    groups: dict[str, list[str]] = {}
+    for card in cards:
+        groups.setdefault(group_id_for(card["image_id"]), []).append(card["image_id"])
+
+    group_ids = sorted(groups)
     rng = random.Random(seed)
-    rng.shuffle(image_ids)
+    rng.shuffle(group_ids)
 
-    total = len(image_ids)
-    train_end = int(round(total * ratios[0]))
-    val_end = train_end + int(round(total * ratios[1]))
-    val_end = min(val_end, total)
+    total = sum(len(members) for members in groups.values())
+    order = ("train", "val", "test")
+    targets = dict(zip(order, (total * ratio for ratio in ratios)))
+    assigned = {split: 0 for split in order}
 
     split_by_image: dict[str, str] = {}
-    for index, image_id in enumerate(image_ids):
-        if index < train_end:
-            split_by_image[image_id] = "train"
-        elif index < val_end:
-            split_by_image[image_id] = "val"
-        else:
-            split_by_image[image_id] = "test"
+    for group_id in group_ids:
+        members = sorted(groups[group_id])
+        # 不足が最大の分割へ入れる。同点なら train / val / test の順で決定的に選ぶ。
+        split = max(order, key=lambda s: (targets[s] - assigned[s], -order.index(s)))
+        for image_id in members:
+            split_by_image[image_id] = split
+        assigned[split] += len(members)
+
     return split_by_image
 
 
@@ -1126,13 +1152,20 @@ def mine_pairs_for_query(
     positives_per_query: int,
     hard_negatives_per_query: int,
     random_negatives_per_query: int,
+    hard_negative_max_ratio: float,
+    captions: dict[str, str] | None,
     rng: random.Random,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     """
     同じ分割のプールから、正例・hard negative・random negative を選ぶ。
 
     hard negative は「制約の一部だけを満たす」画像で、満たした割合が高いものを優先する。
     random negative は「制約をひとつも満たさない」画像から選ぶ。
+
+    hard_negative_max_ratio を 1.0 未満にすると、制約の充足率がその値を超える画像を
+    候補から完全に除外する (安全マージン)。教師が対象を見落とした画像を負例にしてしまう
+    false negative を減らすためのもので、既定では無効 (1.0)。
+    戻り値の第2要素は、このマージンで除外した件数。
     """
 
     split = query["split"]
@@ -1142,6 +1175,7 @@ def mine_pairs_for_query(
     positives: list[tuple[str, float]] = []
     hard_negatives: list[tuple[str, float]] = []
     easy_negatives: list[str] = []
+    ambiguous = 0
 
     for card in pool:
         if card["image_id"] == source_id:
@@ -1151,6 +1185,10 @@ def mine_pairs_for_query(
         if total > 0 and satisfied == total:
             positives.append((card["image_id"], ratio))
         elif satisfied > 0:
+            if ratio > hard_negative_max_ratio:
+                # 正例に近すぎる画像は、教師の見落としによる false negative の可能性が高い。
+                ambiguous += 1
+                continue
             hard_negatives.append((card["image_id"], ratio))
         else:
             easy_negatives.append(card["image_id"])
@@ -1188,6 +1226,12 @@ def mine_pairs_for_query(
         pair_id = "pair:" + hashlib.sha1(
             f"{query['query_id']}|{image_id}".encode("utf-8")
         ).hexdigest()[:20]
+        if captions is None:
+            caption = (card.get("caption_ja") or "").strip() or None
+            caption_source = "teacher_scene_card" if caption else None
+        else:
+            caption = captions.get(image_id)
+            caption_source = "caption_file" if caption else None
         pairs.append(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -1198,9 +1242,12 @@ def mine_pairs_for_query(
                 "difficulty": query["difficulty"],
                 "constraint_count": query["constraint_count"],
                 "supported_facts": query["supported_facts"],
+                "source_image_id": source_id,
                 "split": split,
                 "image_id": image_id,
                 "image_path": card["relative_path"],
+                "caption": caption,
+                "caption_source": caption_source,
                 "label": label,
                 "negative_type": negative_type,
                 "satisfied_constraints": satisfied,
@@ -1218,7 +1265,21 @@ def mine_pairs_for_query(
     for image_id in selected_random_ids:
         add_pair(image_id, 0, "random_negative")
 
-    return pairs
+    return pairs, ambiguous
+
+
+def load_caption_file(path: Path) -> dict[str, str]:
+    """本番と同じ形式のキャプション JSONL を、image_id をキーにして読み込む。"""
+
+    captions: dict[str, str] = {}
+    for record in read_jsonl(path):
+        image_path = record.get("image_path") or record.get("relative_path")
+        caption = (record.get("caption") or "").strip()
+        if not image_path or not caption:
+            continue
+        # 画像ディレクトリが異なっても結合できるよう、ファイル名 (stem) で対応づける。
+        captions[f"bdd100k:{Path(image_path).stem}"] = caption
+    return captions
 
 
 def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
@@ -1226,8 +1287,10 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
     # 教師モデルの呼び出しは数時間かかるので、設定を変えた比較ではカードを共有する。
     if args.scene_cards:
         cards_path = (PROJECT_ROOT / args.scene_cards).resolve()
+        manifest_path = cards_path.parent.parent / "manifests" / "sampled_images.jsonl"
     else:
         cards_path = dataset_dir / "raw_teacher" / "scene_cards.jsonl"
+        manifest_path = dataset_dir / "manifests" / "sampled_images.jsonl"
 
     cards = read_jsonl(cards_path)
     if not cards:
@@ -1238,8 +1301,47 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
 
     # 同じ画像が複数回書かれている場合は最後の1件を採用する。
     cards_by_id = {card["image_id"]: card for card in cards}
+
+    # scene_cards.jsonl は追記式なので、--num-images や --seed を変えて作り直すと
+    # 前回サンプリングした画像のカードが残る。今回のマニフェストにある画像だけを使う。
+    manifest = read_jsonl(manifest_path)
+    manifest_ids = {record["image_id"] for record in manifest}
+    if manifest_ids and not args.ignore_manifest:
+        extra = sorted(set(cards_by_id) - manifest_ids)
+        missing = len(manifest_ids - set(cards_by_id))
+        cards_by_id = {
+            image_id: card for image_id, card in cards_by_id.items() if image_id in manifest_ids
+        }
+        print(
+            f"マニフェスト: {manifest_path} ({len(manifest_ids)} 件)"
+            f" / 対象外として除外したカード {len(extra)} 件 / カード未生成 {missing} 件"
+        )
+        if not cards_by_id:
+            raise RuntimeError(
+                f"{manifest_path} に載っている画像のシーンカードが1件もありません。"
+                " 別のサンプリング結果のカードを使う場合は --ignore-manifest を指定してください。"
+            )
+
     cards = sorted(cards_by_id.values(), key=lambda card: card["image_id"])
     print(f"シーンカード: {len(cards)} 件")
+
+    captions: dict[str, str] | None = None
+    caption_coverage = None
+    if args.caption_file:
+        caption_path = (PROJECT_ROOT / args.caption_file).resolve()
+        captions = load_caption_file(caption_path)
+        covered = sum(1 for card in cards if card["image_id"] in captions)
+        caption_coverage = {
+            "path": relative_to_project(caption_path, PROJECT_ROOT),
+            "captions": len(captions),
+            "covered_images": covered,
+            "coverage": round(covered / len(cards), 4) if cards else 0.0,
+        }
+        print(f"キャプション: {covered}/{len(cards)} 枚をカバー ({caption_path})")
+        if covered == 0:
+            raise RuntimeError(
+                f"{caption_path} のキャプションが、対象画像と1枚も対応しませんでした。"
+            )
 
     ratios = tuple(args.split_ratios)
     split_by_image = assign_splits(cards, ratios, args.split_seed)
@@ -1269,10 +1371,11 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
 
     pairs_by_split: dict[str, list[dict[str, Any]]] = {"train": [], "val": [], "test": []}
     rng = random.Random(args.split_seed)
+    ambiguous_total = 0
 
     for index, query in enumerate(queries, start=1):
         is_eval = query["split"] in ("val", "test")
-        pairs = mine_pairs_for_query(
+        pairs, ambiguous = mine_pairs_for_query(
             query,
             cards_by_split,
             cards_by_id,
@@ -1283,8 +1386,11 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
             random_negatives_per_query=(
                 args.eval_random_negatives_per_query if is_eval else args.random_negatives_per_query
             ),
+            hard_negative_max_ratio=args.hard_negative_max_ratio,
+            captions=captions,
             rng=rng,
         )
+        ambiguous_total += ambiguous
         pairs_by_split[query["split"]].extend(pairs)
         if index % 100 == 0:
             print(f"ペア構成: {index}/{len(queries)} クエリ")
@@ -1300,6 +1406,11 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
         "drop_unreliable_attributes": (
             list(UNRELIABLE_ATTRIBUTES) if args.drop_unreliable_attributes else []
         ),
+        "hard_negative_max_ratio": args.hard_negative_max_ratio,
+        "hard_negatives_dropped_by_margin": ambiguous_total,
+        "caption_source": "caption_file" if captions is not None else "teacher_scene_card",
+        "caption_file": caption_coverage,
+        "split_unit": "video_group",
         "split_ratios": list(ratios),
         "split_seed": args.split_seed,
         "splits": {},
@@ -1346,10 +1457,23 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
         split: {normalize_query_text(query["query_text"]) for query in queries if query["split"] == split}
         for split in cards_by_split
     }
-    isolation: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "image_overlap": {}, "query_text_overlap": {}}
+    groups_by_split = {
+        split: {group_id_for(image_id) for image_id in images_by_split[split]}
+        for split in images_by_split
+    }
+    isolation: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "split_unit": "video_group",
+        "image_overlap": {},
+        "video_group_overlap": {},
+        "query_text_overlap": {},
+    }
     for left, right in itertools.combinations(("train", "val", "test"), 2):
         isolation["image_overlap"][f"{left}|{right}"] = len(
             images_by_split[left] & images_by_split[right]
+        )
+        isolation["video_group_overlap"][f"{left}|{right}"] = len(
+            groups_by_split[left] & groups_by_split[right]
         )
         isolation["query_text_overlap"][f"{left}|{right}"] = len(
             queries_by_split[left] & queries_by_split[right]
@@ -1376,6 +1500,7 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
     )
 
     leaked = sum(isolation["image_overlap"].values()) + sum(isolation["query_text_overlap"].values())
+    leaked += sum(isolation["video_group_overlap"].values())
     leaked += sum(isolation.get("candidate_images_outside_split", {}).values())
     if leaked:
         raise RuntimeError(f"分割間のリークを検出しました: {isolation}")
@@ -1427,6 +1552,22 @@ def parse_args() -> argparse.Namespace:
             " 別設定のデータセットを作るときに指定する。"
         ),
     )
+    parser.add_argument(
+        "--ignore-manifest",
+        action="store_true",
+        help=(
+            "manifests/sampled_images.jsonl による絞り込みを行わず、シーンカードを全件使う。"
+            " 複数回のサンプリング結果をまとめて1つのデータセットにするときだけ指定する。"
+        ),
+    )
+    parser.add_argument(
+        "--caption-file",
+        default=None,
+        help=(
+            "候補ドキュメントに載せるキャプションの JSONL (本番の data/image_captions.jsonl と同形式)。"
+            " 未指定なら教師シーンカードの caption_ja を使う。"
+        ),
+    )
     parser.add_argument("--max-queries", type=int, default=0, help="0 なら制限しない。")
     parser.add_argument("--min-constraints", type=int, default=2)
     parser.add_argument(
@@ -1460,6 +1601,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-negatives-per-query", type=int, default=2)
     parser.add_argument("--eval-hard-negatives-per-query", type=int, default=5)
     parser.add_argument("--eval-random-negatives-per-query", type=int, default=4)
+    parser.add_argument(
+        "--hard-negative-max-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "制約の充足率がこの値を超える画像を、hard negative の候補から除外する (安全マージン)。"
+            " 教師の見落としによる false negative を減らすためのもので、既定 1.0 は無効。"
+            " 誤ラベルが実際に問題だと確認できてから 0.8 などへ下げる。"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1467,6 +1618,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--split-ratios の合計は 1.0 にしてください。")
     if args.positives_per_query < 1:
         parser.error("--positives-per-query は 1 以上を指定してください。")
+    if not 0.0 < args.hard_negative_max_ratio <= 1.0:
+        parser.error("--hard-negative-max-ratio は 0 より大きく 1.0 以下で指定してください。")
 
     return args
 

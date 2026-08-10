@@ -17,8 +17,13 @@ Qwen3-VL-Reranker-8B の学習前後の精度を、同一条件で定量比較�
     - ROC-AUC / PR-AUC
     - スコア 0 を閾値としたときの正解率・適合率・再現率
 
-base と adapter の差については、クエリ単位のペアード・ブートストラップで
+base と adapter の差については、動画グループ単位のペアード・クラスタ・ブートストラップで
 95% 信頼区間と p 値を出す。信頼区間が 0 をまたぐ場合、その差は有意ではない。
+
+この評価が測るのは「教師シーンカードの定義に対する適合度」であり、本番検索の精度そのものではない。
+候補集合は test split (数百枚) の中から教師の構造化事実で選んだものなので、
+本番の「10万枚から初段検索が返した上位50件を再ランキングする」設定とは異なる。
+本番精度を測るには、初段検索の実際の上位候補と人手で作った正解集合が必要になる。
 
 使い方:
 
@@ -208,15 +213,32 @@ def aggregate(query_results: dict[str, dict[str, Any]]) -> dict[str, float]:
     }
 
 
+def cluster_of(pair: PairRecord) -> str:
+    """
+    ブートストラップで独立とみなす単位。
+
+    同じ画像から作られたクエリ (既定で最大2件) も、同じ動画の別フレームから作られたクエリも、
+    ほぼ同じ景色を見ているので互いに独立ではない。クエリ単位で復元抽出すると
+    この相関を無視して信頼区間が実際より狭くなる。動画グループを単位にする。
+    """
+
+    source = (pair.raw or {}).get("source_image_id")
+    if not source:
+        # 旧形式のデータセット (source_image_id なし) ではクエリ単位へ退避する。
+        return pair.query_id
+    return source.split(":")[-1].split("-")[0]
+
+
 def paired_bootstrap(
     base_results: dict[str, dict[str, Any]],
     tuned_results: dict[str, dict[str, Any]],
     metric: str,
     *,
+    clusters: dict[str, str],
     iterations: int,
     seed: int,
 ) -> dict[str, float]:
-    """クエリを復元抽出して、指標差の 95% 信頼区間と両側 p 値を求める。"""
+    """動画グループを復元抽出して、指標差の 95% 信頼区間と両側 p 値を求める。"""
 
     query_ids = sorted(set(base_results) & set(tuned_results))
     if not query_ids:
@@ -228,14 +250,23 @@ def paired_bootstrap(
     ]
     observed = sum(deltas) / len(deltas)
 
+    # クラスタごとに delta をまとめ、クラスタ単位で復元抽出する (cluster bootstrap)。
+    by_cluster: dict[str, list[float]] = {}
+    for query_id, delta in zip(query_ids, deltas):
+        by_cluster.setdefault(clusters.get(query_id, query_id), []).append(delta)
+    cluster_deltas = [by_cluster[key] for key in sorted(by_cluster)]
+
     rng = random.Random(seed)
-    count = len(deltas)
+    count = len(cluster_deltas)
     samples: list[float] = []
     for _ in range(iterations):
         total = 0.0
+        size = 0
         for _ in range(count):
-            total += deltas[rng.randrange(count)]
-        samples.append(total / count)
+            group = cluster_deltas[rng.randrange(count)]
+            total += sum(group)
+            size += len(group)
+        samples.append(total / size if size else 0.0)
 
     samples.sort()
     lower = samples[int(0.025 * iterations)]
@@ -254,6 +285,7 @@ def paired_bootstrap(
         "ci_lower": lower,
         "ci_upper": upper,
         "p_value": p_value,
+        "clusters": count,
         "queries_improved": improved,
         "queries_worsened": worsened,
         "queries_unchanged": len(deltas) - improved - worsened,
@@ -276,6 +308,13 @@ def format_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- アダプタ: `{adapter}`" if adapter else "- アダプタ: なし (base のみ)")
     lines.append(
         f"- 評価規模: クエリ {payload['num_queries']} 件 / ペア {payload['num_pairs']} 件"
+        f" / 動画グループ {payload.get('num_clusters', '-')} 件"
+    )
+    lines.append("")
+    lines.append(
+        "> この評価が測るのは、教師シーンカードの定義に対する適合度である。"
+        "候補集合は test split 内から構造化事実で選んだものなので、"
+        "本番検索 (10万枚の初段検索の上位50件を再ランキング) の精度とは一致しない。"
     )
     lines.append("")
 
@@ -373,6 +412,10 @@ def format_markdown(payload: dict[str, Any]) -> str:
                 f"クエリ単位では 改善 {stats['queries_improved']} 件 / "
                 f"劣化 {stats['queries_worsened']} 件 / 変化なし {stats['queries_unchanged']} 件でした。"
             )
+            lines.append(
+                f"信頼区間は動画グループ {stats.get('clusters', '-')} 件を単位とした"
+                "クラスタ・ブートストラップで求めた。"
+            )
             lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -434,9 +477,15 @@ def main() -> None:
 
     adapter_path = (PROJECT_ROOT / args.adapter_path).resolve() if args.use_adapter else None
     if adapter_path is not None and not (adapter_path / "adapter_config.json").exists():
+        hint = ""
+        if (adapter_path / "last" / "adapter_config.json").exists():
+            hint = (
+                f" 学習で val がベースラインを超えなかった場合、best は保存されません。"
+                f" 最終エポックのアダプタを評価するなら --adapter-path {args.adapter_path}/last を指定してください。"
+            )
         raise RuntimeError(
             f"{adapter_path} に adapter_config.json がありません。"
-            " 学習前のベースラインだけを測る場合は --no-adapter を指定してください。"
+            " 学習前のベースラインだけを測る場合は --no-adapter を指定してください。" + hint
         )
 
     print(f"モデルをロードします: {args.model} ({args.quantization})")
@@ -486,6 +535,9 @@ def main() -> None:
     if adapter_path is not None:
         variants["adapter"] = run_variant("adapter", model.enable_adapters)
 
+    clusters = {pair.query_id: cluster_of(pair) for pair in pairs}
+    num_clusters = len(set(clusters.values()))
+
     comparison: dict[str, dict[str, float]] = {}
     if "adapter" in variants:
         for metric in variants["base"]["ranking"]:
@@ -495,6 +547,7 @@ def main() -> None:
                 variants["base"]["query_results"],
                 variants["adapter"]["query_results"],
                 metric,
+                clusters=clusters,
                 iterations=args.bootstrap_iterations,
                 seed=args.bootstrap_seed,
             )
@@ -519,7 +572,10 @@ def main() -> None:
         "adapter_path": relative_to_project(adapter_path, PROJECT_ROOT) if adapter_path else None,
         "num_queries": query_count,
         "num_pairs": len(pairs),
+        "num_clusters": num_clusters,
         "bootstrap": {
+            "unit": "video_group",
+            "clusters": num_clusters,
             "iterations": args.bootstrap_iterations,
             "seed": args.bootstrap_seed,
         },
