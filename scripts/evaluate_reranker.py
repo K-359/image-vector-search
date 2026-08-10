@@ -17,7 +17,7 @@ Qwen3-VL-Reranker-8B の学習前後の精度を、同一条件で定量比較�
     - ROC-AUC / PR-AUC
     - スコア 0 を閾値としたときの正解率・適合率・再現率
 
-base と adapter の差については、動画グループ単位のペアード・クラスタ・ブートストラップで
+base と adapter の差については、生成元画像単位のペアード・クラスタ・ブートストラップで
 95% 信頼区間と p 値を出す。信頼区間が 0 をまたぐ場合、その差は有意ではない。
 
 この評価が測るのは「教師シーンカードの定義に対する適合度」であり、本番検索の精度そのものではない。
@@ -58,7 +58,9 @@ from reranker_common import (  # noqa: E402
     load_pairs,
     load_reranker,
     relative_to_project,
+    resolve_adapter_path,
     score_pairs,
+    validate_pair_captions,
     write_json,
     write_jsonl,
 )
@@ -217,16 +219,19 @@ def cluster_of(pair: PairRecord) -> str:
     """
     ブートストラップで独立とみなす単位。
 
-    同じ画像から作られたクエリ (既定で最大2件) も、同じ動画の別フレームから作られたクエリも、
-    ほぼ同じ景色を見ているので互いに独立ではない。クエリ単位で復元抽出すると
-    この相関を無視して信頼区間が実際より狭くなる。動画グループを単位にする。
+    同じ画像から作られたクエリ (既定で最大2件) は同じ候補プールを共有するため、
+    互いに独立ではない。クエリ単位で復元抽出するとこの相関を無視して
+    信頼区間が実際より狭くなるので、完全な source_image_id を単位にする。
+
+    BDD100K images_100k のハイフンを含む stem 全体が識別子である。MOT の連続フレームを
+    評価する場合は、ファイル名の一部ではなくメタデータの videoName を使うこと。
     """
 
     source = (pair.raw or {}).get("source_image_id")
     if not source:
         # 旧形式のデータセット (source_image_id なし) ではクエリ単位へ退避する。
         return pair.query_id
-    return source.split(":")[-1].split("-")[0]
+    return source
 
 
 def paired_bootstrap(
@@ -238,7 +243,7 @@ def paired_bootstrap(
     iterations: int,
     seed: int,
 ) -> dict[str, float]:
-    """動画グループを復元抽出して、指標差の 95% 信頼区間と両側 p 値を求める。"""
+    """生成元画像を復元抽出して、指標差の 95% 信頼区間と両側 p 値を求める。"""
 
     query_ids = sorted(set(base_results) & set(tuned_results))
     if not query_ids:
@@ -308,7 +313,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- アダプタ: `{adapter}`" if adapter else "- アダプタ: なし (base のみ)")
     lines.append(
         f"- 評価規模: クエリ {payload['num_queries']} 件 / ペア {payload['num_pairs']} 件"
-        f" / 動画グループ {payload.get('num_clusters', '-')} 件"
+        f" / 生成元画像クラスタ {payload.get('num_clusters', '-')} 件"
     )
     lines.append("")
     lines.append(
@@ -413,7 +418,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
                 f"劣化 {stats['queries_worsened']} 件 / 変化なし {stats['queries_unchanged']} 件でした。"
             )
             lines.append(
-                f"信頼区間は動画グループ {stats.get('clusters', '-')} 件を単位とした"
+                f"信頼区間は生成元画像 {stats.get('clusters', '-')} 件を単位とした"
                 "クラスタ・ブートストラップで求めた。"
             )
             lines.append("")
@@ -451,6 +456,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-queries", type=int, default=0, help="0 なら全件。動作確認用。")
     parser.add_argument("--use-caption", action="store_true")
+    parser.add_argument(
+        "--allow-partial-captions",
+        action="store_true",
+        help=(
+            "--use-caption 時のcaption欠損を承知で許可する。"
+            "候補ごとの入力条件が混在するため、比較実験以外では指定しない。"
+        ),
+    )
     parser.add_argument("--bootstrap-iterations", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=42)
     parser.add_argument("--output-dir", default=None, help="既定はデータセット配下の reports/")
@@ -472,17 +485,37 @@ def main() -> None:
         keep = set(selected)
         pairs = [pair for pair in pairs if pair.query_id in keep]
 
+    if args.use_caption:
+        covered, total = validate_pair_captions(
+            pairs,
+            allow_partial=args.allow_partial_captions,
+            context=f"{args.split} split",
+        )
+        print(f"caption coverage: {covered}/{total} ペア")
+    elif args.allow_partial_captions:
+        raise RuntimeError("--allow-partial-captions は --use-caption と一緒に指定してください。")
+
     query_count = len({pair.query_id for pair in pairs})
     print(f"{args.split}: クエリ {query_count} 件 / ペア {len(pairs)} 件")
 
-    adapter_path = (PROJECT_ROOT / args.adapter_path).resolve() if args.use_adapter else None
+    adapter_path = (
+        resolve_adapter_path((PROJECT_ROOT / args.adapter_path).resolve())
+        if args.use_adapter
+        else None
+    )
     if adapter_path is not None and not (adapter_path / "adapter_config.json").exists():
         hint = ""
-        if (adapter_path / "last" / "adapter_config.json").exists():
-            hint = (
-                f" 学習で val がベースラインを超えなかった場合、best は保存されません。"
-                f" 最終エポックのアダプタを評価するなら --adapter-path {args.adapter_path}/last を指定してください。"
-            )
+        runs_dir = adapter_path / "runs"
+        latest_last = next(
+            (
+                path / "last"
+                for path in sorted(runs_dir.iterdir(), reverse=True)
+                if (path / "last" / "adapter_config.json").is_file()
+            ),
+            None,
+        ) if runs_dir.is_dir() else None
+        if latest_last is not None:
+            hint = f" 最終runを評価するなら --adapter-path {latest_last} を指定してください。"
         raise RuntimeError(
             f"{adapter_path} に adapter_config.json がありません。"
             " 学習前のベースラインだけを測る場合は --no-adapter を指定してください。" + hint
@@ -568,13 +601,14 @@ def main() -> None:
         "quantization": args.quantization,
         "max_pixels": args.max_pixels,
         "use_caption": args.use_caption,
+        "allow_partial_captions": args.allow_partial_captions,
         "instruction": DASHCAM_RERANKER_PROMPT,
         "adapter_path": relative_to_project(adapter_path, PROJECT_ROOT) if adapter_path else None,
         "num_queries": query_count,
         "num_pairs": len(pairs),
         "num_clusters": num_clusters,
         "bootstrap": {
-            "unit": "video_group",
+            "unit": "source_image_id",
             "clusters": num_clusters,
             "iterations": args.bootstrap_iterations,
             "seed": args.bootstrap_seed,

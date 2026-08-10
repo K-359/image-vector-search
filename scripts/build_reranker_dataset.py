@@ -14,10 +14,11 @@ Qwen3-VL-Reranker-8B のドライブレコーダ特化ファインチューニ�
 ラベルは教師モデルの自由記述ではなく、構造化された事実集合に対する決定的な判定で付く。
 そのため同じシーンカードからは常に同じラベルが再現され、学習前後の比較が安定する。
 
-train / val / test は「動画グループ単位」で分割する。BDD100k のファイル名は
-<動画ID>-<フレームID> なので、同じ動画から切り出された別フレームは必ず同じ分割へ入る。
+train / val / test は images_100k の画像ID単位で分割する。images_100k は各動画から
+image task 用に抽出された画像で、ハイフンを含む stem 全体がその画像の識別子になる。
 クエリはその生成元画像の分割に属し、候補画像も同じ分割のプールからのみ選ぶ。
-これにより画像もクエリも、ほぼ同一の景色も、分割をまたがない。
+MOT の連続フレームを扱う場合は、ファイル名を推測せず BDD100K メタデータの
+videoName を別途グループキーとして使用する必要がある。
 
 使い方:
 
@@ -864,17 +865,9 @@ def image_id_for(path: Path) -> str:
 
 
 def group_id_for(image_id: str) -> str:
-    """
-    同じ動画から切り出されたと考えられる画像をまとめるキー。
+    """images_100k の分割単位。ハイフンを含む完全な画像IDを使う。"""
 
-    BDD100k のファイル名は <動画ID>-<フレームID>.jpg で、
-    images_100k の 100,003 枚は 60,141 個の動画IDしか持たない。
-    つまり同じ動画の別フレームが多数含まれる (最大 48 枚)。
-    これらを別々の分割へ入れると、ほぼ同じ景色が train と test の両方に現れ、
-    学習前後の差を過大評価してしまう。分割は動画ID単位で行う。
-    """
-
-    return image_id.split(":")[-1].split("-")[0]
+    return image_id
 
 
 def acquire_cards_lock(dataset_dir: Path) -> Path:
@@ -1025,10 +1018,9 @@ def assign_splits(
     cards: list[dict[str, Any]], ratios: tuple[float, float, float], seed: int
 ) -> dict[str, str]:
     """
-    動画グループ単位で train / val / test を割り当てる。
+    source image 単位で train / val / test を割り当てる。
 
-    同じ動画の別フレームは必ず同じ分割へ入る。
-    グループはシャッフル後、目標枚数に対して最も不足している分割へ順に詰める。
+    画像IDはシャッフル後、目標枚数に対して最も不足している分割へ順に詰める。
     """
 
     groups: dict[str, list[str]] = {}
@@ -1282,6 +1274,55 @@ def load_caption_file(path: Path) -> dict[str, str]:
     return captions
 
 
+def load_manifest_ids(path: Path, *, ignore_manifest: bool) -> set[str] | None:
+    """対象画像マニフェストを厳格に読み込む。明示指定時だけ絞り込みを無効化する。"""
+
+    if ignore_manifest:
+        return None
+    if not path.is_file():
+        raise RuntimeError(
+            f"マニフェストが見つかりません: {path}。"
+            " 絞り込みを意図的に無効化する場合だけ --ignore-manifest を指定してください。"
+        )
+    manifest = read_jsonl(path)
+    if not manifest:
+        raise RuntimeError(
+            f"マニフェストが空です: {path}。"
+            " 絞り込みを意図的に無効化する場合だけ --ignore-manifest を指定してください。"
+        )
+    if any(not record.get("image_id") for record in manifest):
+        raise RuntimeError(f"{path} に image_id のないレコードがあります。")
+    return {record["image_id"] for record in manifest}
+
+
+def caption_coverage_for_cards(
+    cards: list[dict[str, Any]],
+    captions: dict[str, str],
+    *,
+    path: Path,
+    allow_partial: bool,
+) -> dict[str, Any]:
+    """外部captionが対象画像をカバーすることを検証し、記録用統計を返す。"""
+
+    covered = sum(1 for card in cards if card["image_id"] in captions)
+    total = len(cards)
+    if covered == 0:
+        raise RuntimeError(f"{path} のキャプションが、対象画像と1枚も対応しませんでした。")
+    if covered != total and not allow_partial:
+        raise RuntimeError(
+            f"{path} の caption coverage は {covered}/{total} です。"
+            " --caption-file を使う場合は全対象画像のcaptionが必要です。"
+            " 欠損を承知で混在させる場合だけ --allow-partial-captions を指定してください。"
+        )
+    return {
+        "path": relative_to_project(path, PROJECT_ROOT),
+        "captions": len(captions),
+        "covered_images": covered,
+        "coverage": round(covered / total, 4) if total else 0.0,
+        "partial_allowed": allow_partial,
+    }
+
+
 def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
     # --scene-cards を使うと、既存のラベリング結果から別設定のデータセットを作れる。
     # 教師モデルの呼び出しは数時間かかるので、設定を変えた比較ではカードを共有する。
@@ -1304,9 +1345,8 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
 
     # scene_cards.jsonl は追記式なので、--num-images や --seed を変えて作り直すと
     # 前回サンプリングした画像のカードが残る。今回のマニフェストにある画像だけを使う。
-    manifest = read_jsonl(manifest_path)
-    manifest_ids = {record["image_id"] for record in manifest}
-    if manifest_ids and not args.ignore_manifest:
+    manifest_ids = load_manifest_ids(manifest_path, ignore_manifest=args.ignore_manifest)
+    if manifest_ids is not None:
         extra = sorted(set(cards_by_id) - manifest_ids)
         missing = len(manifest_ids - set(cards_by_id))
         cards_by_id = {
@@ -1321,6 +1361,8 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
                 f"{manifest_path} に載っている画像のシーンカードが1件もありません。"
                 " 別のサンプリング結果のカードを使う場合は --ignore-manifest を指定してください。"
             )
+    else:
+        print("警告: --ignore-manifest によりシーンカードを全件使用します。")
 
     cards = sorted(cards_by_id.values(), key=lambda card: card["image_id"])
     print(f"シーンカード: {len(cards)} 件")
@@ -1330,18 +1372,16 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
     if args.caption_file:
         caption_path = (PROJECT_ROOT / args.caption_file).resolve()
         captions = load_caption_file(caption_path)
-        covered = sum(1 for card in cards if card["image_id"] in captions)
-        caption_coverage = {
-            "path": relative_to_project(caption_path, PROJECT_ROOT),
-            "captions": len(captions),
-            "covered_images": covered,
-            "coverage": round(covered / len(cards), 4) if cards else 0.0,
-        }
+        caption_coverage = caption_coverage_for_cards(
+            cards,
+            captions,
+            path=caption_path,
+            allow_partial=args.allow_partial_captions,
+        )
+        covered = caption_coverage["covered_images"]
         print(f"キャプション: {covered}/{len(cards)} 枚をカバー ({caption_path})")
-        if covered == 0:
-            raise RuntimeError(
-                f"{caption_path} のキャプションが、対象画像と1枚も対応しませんでした。"
-            )
+    elif args.allow_partial_captions:
+        raise RuntimeError("--allow-partial-captions は --caption-file と一緒に指定してください。")
 
     ratios = tuple(args.split_ratios)
     split_by_image = assign_splits(cards, ratios, args.split_seed)
@@ -1410,7 +1450,7 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
         "hard_negatives_dropped_by_margin": ambiguous_total,
         "caption_source": "caption_file" if captions is not None else "teacher_scene_card",
         "caption_file": caption_coverage,
-        "split_unit": "video_group",
+        "split_unit": "source_image_id",
         "split_ratios": list(ratios),
         "split_seed": args.split_seed,
         "splits": {},
@@ -1463,16 +1503,16 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
     }
     isolation: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "split_unit": "video_group",
+        "split_unit": "source_image_id",
         "image_overlap": {},
-        "video_group_overlap": {},
+        "source_image_overlap": {},
         "query_text_overlap": {},
     }
     for left, right in itertools.combinations(("train", "val", "test"), 2):
         isolation["image_overlap"][f"{left}|{right}"] = len(
             images_by_split[left] & images_by_split[right]
         )
-        isolation["video_group_overlap"][f"{left}|{right}"] = len(
+        isolation["source_image_overlap"][f"{left}|{right}"] = len(
             groups_by_split[left] & groups_by_split[right]
         )
         isolation["query_text_overlap"][f"{left}|{right}"] = len(
@@ -1500,7 +1540,7 @@ def run_pairs_stage(args: argparse.Namespace, dataset_dir: Path) -> None:
     )
 
     leaked = sum(isolation["image_overlap"].values()) + sum(isolation["query_text_overlap"].values())
-    leaked += sum(isolation["video_group_overlap"].values())
+    leaked += sum(isolation["source_image_overlap"].values())
     leaked += sum(isolation.get("candidate_images_outside_split", {}).values())
     if leaked:
         raise RuntimeError(f"分割間のリークを検出しました: {isolation}")
@@ -1566,6 +1606,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "候補ドキュメントに載せるキャプションの JSONL (本番の data/image_captions.jsonl と同形式)。"
             " 未指定なら教師シーンカードの caption_ja を使う。"
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial-captions",
+        action="store_true",
+        help=(
+            "--caption-file の欠損を承知で許可する。候補ごとの入力条件が混在するため、"
+            "比較実験以外では指定しない。"
         ),
     )
     parser.add_argument("--max-queries", type=int, default=0, help="0 なら制限しない。")

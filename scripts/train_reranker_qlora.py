@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -51,6 +52,7 @@ from reranker_common import (  # noqa: E402
     load_pairs,
     load_reranker,
     relative_to_project,
+    validate_pair_captions,
     write_json,
 )
 
@@ -145,6 +147,14 @@ def parse_args() -> argparse.Namespace:
         "--use-caption",
         action="store_true",
         help="候補ドキュメントに事前生成キャプションも含める (caption モード相当)。",
+    )
+    parser.add_argument(
+        "--allow-partial-captions",
+        action="store_true",
+        help=(
+            "--use-caption 時のcaption欠損を承知で許可する。"
+            "候補ごとの入力条件が混在するため、比較実験以外では指定しない。"
+        ),
     )
 
     return parser.parse_args()
@@ -365,6 +375,77 @@ def group_shuffled_batches(
     return batched(ordered, batch_size)
 
 
+def training_schedule(
+    num_pairs: int,
+    batch_size: int,
+    epochs: float,
+    gradient_accumulation_steps: int,
+) -> tuple[list[int], int]:
+    """各epochのmicro batch数と、端数更新を含むoptimizer step数を計算する。"""
+
+    if num_pairs <= 0:
+        raise ValueError("num_pairs は1以上である必要があります。")
+    if batch_size <= 0 or gradient_accumulation_steps <= 0 or epochs <= 0:
+        raise ValueError("batch_size、epochs、gradient_accumulation_steps は正数が必要です。")
+
+    batches_per_epoch = math.ceil(num_pairs / batch_size)
+    total_micro_steps = max(1, math.ceil(batches_per_epoch * epochs))
+    epoch_micro_steps: list[int] = []
+    remaining = total_micro_steps
+    while remaining:
+        current = min(batches_per_epoch, remaining)
+        epoch_micro_steps.append(current)
+        remaining -= current
+    total_optimizer_steps = sum(
+        math.ceil(steps / gradient_accumulation_steps) for steps in epoch_micro_steps
+    )
+    return epoch_micro_steps, total_optimizer_steps
+
+
+def create_run_directory(output_dir: Path) -> Path:
+    """既存成果物と混在しない、この実行専用の出力先を作る。"""
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + f"_{os.getpid()}"
+    run_dir = output_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def promote_best_checkpoint(run_best_dir: Path, output_dir: Path) -> Path:
+    """成功したrunのbestを、既存bestを壊さず原子的に昇格する。"""
+
+    if not (run_best_dir / "adapter_config.json").is_file():
+        raise RuntimeError(f"昇格対象に adapter_config.json がありません: {run_best_dir}")
+    if not any(
+        (run_best_dir / filename).is_file()
+        for filename in ("adapter_model.safetensors", "adapter_model.bin")
+    ):
+        raise RuntimeError(f"昇格対象にアダプタの重みがありません: {run_best_dir}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_link = output_dir / "best"
+    if os.path.lexists(best_link) and not best_link.is_symlink():
+        raise RuntimeError(
+            f"{best_link} がシンボリックリンクではありません。安全のため自動置換しません。"
+        )
+
+    temporary_link = output_dir / f".best.{run_best_dir.parent.name}.{os.getpid()}.tmp"
+    if os.path.lexists(temporary_link):
+        raise RuntimeError(f"一時リンクが既に存在します: {temporary_link}")
+    target = os.path.relpath(run_best_dir, output_dir)
+    temporary_link.symlink_to(target, target_is_directory=True)
+    try:
+        os.replace(temporary_link, best_link)
+    except Exception:
+        temporary_link.unlink(missing_ok=True)
+        raise
+    return best_link
+
+
+def metric_improved(metrics: dict[str, float], best_metric: float) -> bool:
+    return metrics["ndcg@5"] > best_metric
+
+
 def main() -> None:
     args = parse_args()
 
@@ -377,14 +458,6 @@ def main() -> None:
     output_dir = (PROJECT_ROOT / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 前回の実行で書かれた best アダプタが残っていると、今回 best を1度も更新しなかった場合に
-    # 古いアダプタを今回の結果と取り違える。実行開始時に必ず消しておく。
-    for stale in ("adapter_config.json", "adapter_model.safetensors", "adapter_metrics.json"):
-        path = output_dir / stale
-        if path.exists():
-            print(f"前回の best アダプタを削除します: {path.name}")
-            path.unlink()
-
     train_pairs = load_pairs(dataset_dir / "pairs.train.jsonl")
     val_pairs = load_pairs(dataset_dir / "pairs.val.jsonl")
     if not train_pairs:
@@ -394,6 +467,19 @@ def main() -> None:
         train_pairs = train_pairs[: args.max_train_pairs]
     if args.max_val_pairs > 0:
         val_pairs = val_pairs[: args.max_val_pairs]
+
+    if args.use_caption:
+        for name, pairs in (("train split", train_pairs), ("val split", val_pairs)):
+            if not pairs:
+                continue
+            covered, total = validate_pair_captions(
+                pairs,
+                allow_partial=args.allow_partial_captions,
+                context=name,
+            )
+            print(f"{name} caption coverage: {covered}/{total} ペア")
+    elif args.allow_partial_captions:
+        raise RuntimeError("--allow-partial-captions は --use-caption と一緒に指定してください。")
 
     positives = sum(1 for pair in train_pairs if pair.label == 1)
     negatives = len(train_pairs) - positives
@@ -419,6 +505,9 @@ def main() -> None:
     lora_config = attach_lora(model, args)
     model.train()
 
+    run_dir = create_run_directory(output_dir)
+    print(f"run出力先: {run_dir}")
+
     trainable_parameters = [
         parameter for parameter in model.transformers_model.parameters() if parameter.requires_grad
     ]
@@ -428,9 +517,13 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    steps_per_epoch = max(1, len(train_pairs) // args.batch_size)
-    total_micro_steps = int(steps_per_epoch * args.epochs)
-    total_optimizer_steps = max(1, total_micro_steps // args.gradient_accumulation_steps)
+    epoch_micro_steps, total_optimizer_steps = training_schedule(
+        len(train_pairs),
+        args.batch_size,
+        args.epochs,
+        args.gradient_accumulation_steps,
+    )
+    total_micro_steps = sum(epoch_micro_steps)
     warmup_steps = max(1, int(total_optimizer_steps * args.warmup_ratio))
 
     from transformers import get_cosine_schedule_with_warmup
@@ -472,13 +565,17 @@ def main() -> None:
         },
         "instruction": DASHCAM_RERANKER_PROMPT,
         "use_caption": args.use_caption,
+        "allow_partial_captions": args.allow_partial_captions,
         "train_pairs": len(train_pairs),
         "val_pairs": len(val_pairs),
     }
-    write_json(output_dir / "train_config.json", run_config)
+    run_config["run_dir"] = relative_to_project(run_dir, PROJECT_ROOT)
+    run_config["optimization"]["micro_steps_per_epoch"] = epoch_micro_steps
+    run_config["optimization"]["total_micro_steps"] = total_micro_steps
+    write_json(run_dir / "train_config.json", run_config)
 
     def save_adapter(tag: str, metrics: dict[str, float]) -> Path:
-        adapter_dir = output_dir if tag == "best" else output_dir / tag
+        adapter_dir = run_dir / tag
         adapter_dir.mkdir(parents=True, exist_ok=True)
         model.transformers_model.save_pretrained(
             str(adapter_dir), selected_adapters=[ADAPTER_NAME], save_embedding_layers=False
@@ -525,17 +622,72 @@ def main() -> None:
         best_metric = baseline["ndcg@5"]
         baseline_metric = baseline["ndcg@5"]
 
-    total_epochs = int(math.ceil(args.epochs))
-    stop = False
+    accumulated_micro_batches = 0
 
-    for epoch in range(total_epochs):
-        if stop:
-            break
-        for batch in group_shuffled_batches(train_pairs, args.batch_size, rng):
-            if micro_step >= total_micro_steps:
-                stop = True
-                break
+    def maybe_save_best(label: str, metrics: dict[str, float]) -> None:
+        nonlocal best_metric, best_saved
+        if metric_improved(metrics, best_metric):
+            best_metric = metrics["ndcg@5"]
+            save_adapter("best", metrics)
+            best_saved = True
+            print(f"  -> {label} でbestを更新しました (nDCG@5={best_metric:.4f})")
 
+    def apply_optimizer_update(pending_micro_batches: int) -> None:
+        nonlocal optimizer_step
+        if pending_micro_batches <= 0:
+            return
+        if pending_micro_batches < args.gradient_accumulation_steps:
+            # 各lossは通常のaccumulation数で割っているため、端数時だけ平均勾配へ戻す。
+            scale = args.gradient_accumulation_steps / pending_micro_batches
+            for parameter in trainable_parameters:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(scale)
+        torch.nn.utils.clip_grad_norm_(trainable_parameters, args.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        optimizer_step += 1
+
+    def after_optimizer_update(epoch: int) -> None:
+        nonlocal accumulated_loss, accumulated_micro_batches
+        if optimizer_step % args.log_every_steps == 0:
+            mean_loss = accumulated_loss / max(accumulated_micro_batches, 1)
+            elapsed = time.monotonic() - started_at
+            remaining = elapsed / optimizer_step * (total_optimizer_steps - optimizer_step)
+            peak = (
+                torch.cuda.max_memory_allocated() / 1024**3
+                if torch.cuda.is_available()
+                else 0.0
+            )
+            print(
+                f"[epoch {epoch + 1} step {optimizer_step}/{total_optimizer_steps}] "
+                f"loss={mean_loss:.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                f"peak_vram={peak:.1f}GiB 残り約 {remaining / 60:.0f} 分"
+            )
+            history.append({"optimizer_step": optimizer_step, "train_loss": mean_loss})
+            accumulated_loss = 0.0
+            accumulated_micro_batches = 0
+
+        if (
+            val_pairs
+            and args.eval_every_steps > 0
+            and optimizer_step % args.eval_every_steps == 0
+        ):
+            metrics = evaluate_val(
+                model,
+                val_pairs,
+                batch_size=args.eval_batch_size,
+                use_caption=args.use_caption,
+                pos_weight=pos_weight,
+            )
+            print(f"[step {optimizer_step}] val: {json.dumps(metrics, ensure_ascii=False)}")
+            history.append({"optimizer_step": optimizer_step, "val": metrics})
+            maybe_save_best(f"step {optimizer_step}", metrics)
+
+    for epoch, steps_this_epoch in enumerate(epoch_micro_steps):
+        pending_micro_batches = 0
+        batches = group_shuffled_batches(train_pairs, args.batch_size, rng)
+        for batch in batches[:steps_this_epoch]:
             scores = forward_scores(model, batch, use_caption=args.use_caption)
             labels = torch.tensor(
                 [float(pair.label) for pair in batch], device=scores.device, dtype=torch.float32
@@ -546,61 +698,21 @@ def main() -> None:
             (loss / args.gradient_accumulation_steps).backward()
 
             accumulated_loss += float(loss.detach())
+            accumulated_micro_batches += 1
+            pending_micro_batches += 1
             micro_step += 1
 
-            if micro_step % args.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(trainable_parameters, args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                optimizer_step += 1
+            if pending_micro_batches == args.gradient_accumulation_steps:
+                apply_optimizer_update(pending_micro_batches)
+                pending_micro_batches = 0
+                after_optimizer_update(epoch)
 
-                if optimizer_step % args.log_every_steps == 0:
-                    mean_loss = accumulated_loss / (
-                        args.log_every_steps * args.gradient_accumulation_steps
-                    )
-                    elapsed = time.monotonic() - started_at
-                    remaining = (
-                        elapsed / optimizer_step * (total_optimizer_steps - optimizer_step)
-                        if optimizer_step
-                        else 0.0
-                    )
-                    peak = (
-                        torch.cuda.max_memory_allocated() / 1024**3
-                        if torch.cuda.is_available()
-                        else 0.0
-                    )
-                    print(
-                        f"[epoch {epoch + 1} step {optimizer_step}/{total_optimizer_steps}] "
-                        f"loss={mean_loss:.4f} lr={scheduler.get_last_lr()[0]:.2e} "
-                        f"peak_vram={peak:.1f}GiB 残り約 {remaining / 60:.0f} 分"
-                    )
-                    history.append(
-                        {"optimizer_step": optimizer_step, "train_loss": mean_loss}
-                    )
-                    accumulated_loss = 0.0
+        # epoch末の端数も平均勾配として反映してからvalを測る。
+        if pending_micro_batches:
+            apply_optimizer_update(pending_micro_batches)
+            after_optimizer_update(epoch)
 
-                if (
-                    val_pairs
-                    and args.eval_every_steps > 0
-                    and optimizer_step % args.eval_every_steps == 0
-                ):
-                    metrics = evaluate_val(
-                        model,
-                        val_pairs,
-                        batch_size=args.eval_batch_size,
-                        use_caption=args.use_caption,
-                        pos_weight=pos_weight,
-                    )
-                    print(f"[step {optimizer_step}] val: {json.dumps(metrics, ensure_ascii=False)}")
-                    history.append({"optimizer_step": optimizer_step, "val": metrics})
-                    if metrics["ndcg@5"] > best_metric:
-                        best_metric = metrics["ndcg@5"]
-                        save_adapter("best", metrics)
-                        best_saved = True
-                        print(f"  -> best を更新しました (nDCG@5={best_metric:.4f})")
-
-        if val_pairs and not stop:
+        if val_pairs:
             metrics = evaluate_val(
                 model,
                 val_pairs,
@@ -610,11 +722,7 @@ def main() -> None:
             )
             print(f"[epoch {epoch + 1} 終了] val: {json.dumps(metrics, ensure_ascii=False)}")
             history.append({"epoch": epoch + 1, "optimizer_step": optimizer_step, "val": metrics})
-            if metrics["ndcg@5"] > best_metric:
-                best_metric = metrics["ndcg@5"]
-                save_adapter("best", metrics)
-                best_saved = True
-                print(f"  -> best を更新しました (nDCG@5={best_metric:.4f})")
+            maybe_save_best(f"epoch {epoch + 1}", metrics)
 
     final_metrics = (
         evaluate_val(
@@ -627,20 +735,29 @@ def main() -> None:
         if val_pairs
         else {}
     )
+    if val_pairs:
+        maybe_save_best("最終評価", final_metrics)
     last_dir = save_adapter("last", final_metrics)
 
     if not val_pairs:
-        # val がなければ選びようがないので、最終アダプタをそのまま直下へ置く。
+        # val がなければ選びようがないので、このrunの最終アダプタをbestとして保存する。
         save_adapter("best", final_metrics)
         best_saved = True
 
+    promoted_path = (
+        promote_best_checkpoint(run_dir / "best", output_dir) if best_saved else None
+    )
+
     write_json(
-        output_dir / "train_history.json",
+        run_dir / "train_history.json",
         {
             "history": history,
             "baseline_val_ndcg@5": baseline_metric,
-            "best_val_ndcg@5": best_metric,
+            "best_val_ndcg@5": best_metric if val_pairs else None,
             "best_checkpoint_saved": best_saved,
+            "promoted_best": (
+                relative_to_project(promoted_path, PROJECT_ROOT) if promoted_path else None
+            ),
             "final_val": final_metrics,
             "elapsed_seconds": round(time.monotonic() - started_at, 1),
         },
@@ -648,15 +765,17 @@ def main() -> None:
 
     print(f"最終 val: {json.dumps(final_metrics, ensure_ascii=False)}")
     if best_saved:
-        print(f"学習完了。best アダプタ: {output_dir} (val nDCG@5={best_metric:.4f})")
-        print(f"最終エポックのアダプタ: {last_dir}")
+        metric_text = f" (val nDCG@5={best_metric:.4f})" if val_pairs else ""
+        print(f"学習完了。best アダプタ: {promoted_path}{metric_text}")
+        print(f"このrunの最終アダプタ: {last_dir}")
     else:
         # ベースライン以下のアダプタを best として置くと、評価スクリプトが
         # 「学習で改善した」ように見える出力を作ってしまう。あえて何も置かない。
         print(
             f"学習完了。ただし val nDCG@5 が学習前 ({baseline_metric:.4f}) を一度も超えませんでした。"
         )
-        print(f"best アダプタは保存していません。最終エポックのアダプタ: {last_dir}")
+        print(f"このrunはbestへ昇格していません。以前のbestは変更していません: {output_dir / 'best'}")
+        print(f"このrunの最終アダプタ: {last_dir}")
         print(
             "そのまま評価する場合は --adapter-path に上記の last/ を指定してください"
             " (学習前より悪い可能性があります)。"

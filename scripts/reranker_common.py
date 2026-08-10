@@ -35,8 +35,10 @@ __all__ = [
     "resolve_image_path",
     "load_reranker",
     "attach_adapter",
+    "resolve_adapter_path",
     "score_pairs",
     "build_predict_pairs",
+    "validate_pair_captions",
 ]
 
 DEFAULT_ADAPTER_NAME = "dashcam"
@@ -141,6 +143,30 @@ def load_pairs(path: Path) -> list[PairRecord]:
     return [PairRecord.from_dict(record) for record in read_jsonl(path)]
 
 
+def validate_pair_captions(
+    pairs: list[PairRecord],
+    *,
+    allow_partial: bool = False,
+    context: str = "データセット",
+) -> tuple[int, int]:
+    """caption モードで候補ごとの入力条件が意図せず混在しないことを検証する。"""
+
+    total = len(pairs)
+    covered = sum(1 for pair in pairs if pair.caption and pair.caption.strip())
+    if covered == 0:
+        raise RuntimeError(
+            f"{context} の {total} ペアに利用可能な caption がありません。"
+            " --use-caption を外すか、caption を含むペアを作成してください。"
+        )
+    if covered != total and not allow_partial:
+        raise RuntimeError(
+            f"{context} の caption coverage は {covered}/{total} です。"
+            " caption モードでは全ペアの caption が必要です。"
+            " 欠損を承知で混在させる場合だけ --allow-partial-captions を指定してください。"
+        )
+    return covered, total
+
+
 def relative_to_project(path: Path, project_root: Path) -> str:
     """レポートへ書くための相対パス。プロジェクト外なら絶対パスのまま返す。"""
 
@@ -157,6 +183,21 @@ def resolve_image_path(image_path: str, project_root: Path) -> Path:
     if candidate.is_absolute():
         return candidate
     return (project_root / candidate).resolve()
+
+
+def resolve_adapter_path(adapter_path: Path) -> Path:
+    """
+    run 管理形式の ``best`` と、旧形式の直下アダプタの両方を解決する。
+
+    新形式を優先することで、旧形式の重みを残したまま安全に移行できる。
+    """
+
+    promoted = adapter_path / "best"
+    if (promoted / "adapter_config.json").is_file():
+        return promoted.resolve()
+    if (adapter_path / "adapter_config.json").is_file():
+        return adapter_path.resolve()
+    return adapter_path.resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +289,7 @@ def attach_adapter(model, adapter_path: Path, *, adapter_name: str = DEFAULT_ADA
 
     from peft import LoraConfig, load_peft_weights, set_peft_model_state_dict
 
+    adapter_path = resolve_adapter_path(adapter_path)
     config_path = adapter_path / "adapter_config.json"
     if not config_path.exists():
         raise RuntimeError(f"{config_path} がありません。アダプタのパスを確認してください。")
