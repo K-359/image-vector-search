@@ -702,13 +702,43 @@ scores_test_20260810_153012.jsonl ペアごとの base / adapter スコア
 
 `scores_*.jsonl` を見ると、どのクエリでどの画像の順位が入れ替わったかを個別に確認できます。
 
-### 4. 学習したアダプタを検索で使う
+### 4. 学習したアダプタを10万枚検索で使う
 
-`scripts/search.py` は現時点ではベースモデルだけを読み込みます。
-アダプタを本番検索へ入れる場合は、Reranker のロード後に
-`reranker_common.attach_adapter(model, adapter_path)` を呼んでください。
-transformers の `load_adapter` は内部でモデル全体分の VRAM を先取りしようとするため、
-16GB では量子化済みモデルの上で失敗します。`attach_adapter` はこれを避ける実装です。
+`--reranker-adapter`へモデル出力ディレクトリを指定すると、昇格済みの`best/`を自動的に解決し、
+8bit量子化したRerankerへLoRAを適用します。既存の100Kインデックスは`data_100k/`、実画像は
+`images_100k/`にあるため、両方を明示します。
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" \
+  --data-dir data_100k \
+  --image-dir images_100k \
+  --reranker-adapter models/qwen3-vl-reranker-8b-dashcam-v1 \
+  --skip-image-search-decision \
+  --skip-answer-generation
+```
+
+アダプタ未指定なら従来どおりbaseモデルを使います。同じクエリをbaseでも確認する場合:
+
+```bash
+python scripts/search.py "赤い車が雪道を走っている" \
+  --data-dir data_100k \
+  --image-dir images_100k \
+  --skip-image-search-decision \
+  --skip-answer-generation
+```
+
+各検索結果には次のファイルが追加されます。
+
+- `search_metadata.json`: base/adapter、モデル、解決済みアダプタ、インデックス件数
+- `reranker_candidates.jsonl`: 初段上位50件の初段順位、再ランキング順位、各スコア
+
+`reranker_candidates.jsonl`の`relevance`は人手gold用に`null`で出力します。画像を確認して
+`0`（不適合）、`1`（部分的に適合）、`2`（検索意図へ適合）のいずれかを付ければ、
+本番の初段top-50候補を対象にした評価データとして再利用できます。同じクエリのbase版とadapter版は
+初段候補集合が同一なので、一度付けたgoldを`image_path`で共有できます。
+
+transformersの`load_adapter`は内部でモデル全体分のVRAMを先取りするため使わず、
+`scripts/reranker_adapter.py`が`add_adapter`後にLoRA重みだけを読み込みます。
 
 ## よく使うコマンド
 

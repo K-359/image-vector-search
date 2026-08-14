@@ -15,6 +15,11 @@ from datetime import datetime
 from pathlib import Path
 
 try:
+    from .reranker_adapter import attach_adapter, resolve_adapter_path
+except ImportError:
+    from reranker_adapter import attach_adapter, resolve_adapter_path
+
+try:
     import readline  # noqa: F401
 except ImportError:
     pass
@@ -43,6 +48,7 @@ CAPTION_BATCH_SIZE = 5
 CAPTION_RRF_K = 60
 RERANK_CANDIDATES = 50
 RERANKER_BATCH_SIZE = 1
+RERANKER_ADAPTER_NAME = "dashcam"
 DASHCAM_RETRIEVAL_PROMPT = (
     "Retrieve dashcam images that visually show the road scene, traffic participant, "
     "dangerous behavior, collision, or near-miss event described in the user's query."
@@ -1135,6 +1141,69 @@ def format_score_fields(result: SearchResult) -> str:
     return "  ".join(fields)
 
 
+def build_reranker_candidate_records(
+    ranked_results: list[SearchResult],
+    image_paths: list[str],
+    *,
+    initial_ranks: dict[int, int],
+    candidate_count: int,
+) -> list[dict]:
+    """人手gold付与とbase/adapter比較に使う再ランキング候補を構造化する。"""
+
+    records = []
+    reranked = [result for result in ranked_results if result.image_id in initial_ranks]
+    for reranker_rank, result in enumerate(reranked[:candidate_count], start=1):
+        records.append(
+            {
+                "image_id": result.image_id,
+                "image_path": image_paths[result.image_id],
+                "retrieval_rank": initial_ranks[result.image_id],
+                "reranker_rank": reranker_rank,
+                "retrieval_score": result.retrieval_score,
+                "reranker_score": result.reranker_score,
+                "vector_score": result.vector_score,
+                "bm25_score": result.bm25_score,
+                "caption": result.caption,
+            }
+        )
+    return records
+
+
+def write_search_metadata(result_dir: Path, payload: dict) -> None:
+    with (result_dir / "search_metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def write_jsonl_records(path: Path, records: list[dict]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def resolve_index_image_paths(stored_paths: list[str], image_dir: Path | None) -> list[str]:
+    """移動済みインデックスの画像パスを、ファイル名を保ったまま新しい画像dirへ付け替える。"""
+
+    if image_dir is None:
+        return stored_paths
+    resolved_dir = image_dir.expanduser().resolve()
+    if not resolved_dir.is_dir():
+        raise RuntimeError(f"画像ディレクトリが見つかりません: {resolved_dir}")
+    remapped = [str(resolved_dir / Path(path).name) for path in stored_paths]
+    if len(remapped) != len(set(remapped)):
+        raise RuntimeError(
+            f"{resolved_dir} へ付け替えると画像ファイル名が重複します。"
+            "インデックスと対応する一意な画像ディレクトリを指定してください。"
+        )
+    missing = [path for path in remapped if not Path(path).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"--image-dir への付け替え後に {len(missing)} 件の画像が見つかりません。"
+            f" 例: {missing[0]}"
+        )
+    return remapped
+
+
 def shorten_text(text: str, max_length: int = 120) -> str:
     normalized = re.sub(r"\s+", " ", text).strip()
     if len(normalized) <= max_length:
@@ -1157,6 +1226,21 @@ def main():
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--bottom-k", type=int, default=10, help="下位検索結果として出力する件数。")
     parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DATA_DIR,
+        help=f"画像FAISSインデックスのディレクトリ。デフォルト: {DATA_DIR}",
+    )
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=None,
+        help=(
+            "インデックス作成後に画像を移動した場合の実画像ディレクトリ。"
+            "指定時はimage_paths.jsonの各パスをファイル名で付け替える。"
+        ),
+    )
+    parser.add_argument(
         "--rerank-candidates",
         type=int,
         default=RERANK_CANDIDATES,
@@ -1169,6 +1253,15 @@ def main():
         "--reranker-model",
         default=RERANKER_MODEL_NAME,
         help=f"再ランキングに使うモデル。デフォルト: {RERANKER_MODEL_NAME}",
+    )
+    parser.add_argument(
+        "--reranker-adapter",
+        type=Path,
+        default=None,
+        help=(
+            "再ランカーへ適用するLoRAアダプタ。モデル出力ディレクトリを指定するとbest/を自動解決する。"
+            "未指定ならベースモデルを使う。"
+        ),
     )
     parser.add_argument(
         "--embedding-device",
@@ -1286,6 +1379,12 @@ def main():
         parser.error("--bottom-k は 0 以上を指定してください。")
     if args.rerank_candidates < 0:
         parser.error("--rerank-candidates は 0 以上を指定してください。")
+    if args.reranker_adapter is not None:
+        if args.rerank_candidates == 0:
+            parser.error("--reranker-adapter は --rerank-candidates 1以上で使用してください。")
+        resolved = resolve_adapter_path(args.reranker_adapter)
+        if not (resolved / "adapter_config.json").is_file():
+            parser.error(f"{resolved} に adapter_config.json がありません。")
     if args.reranker_batch_size <= 0:
         parser.error("--reranker-batch-size は 1 以上を指定してください。")
     if args.caption_rrf_k <= 0:
@@ -1315,6 +1414,7 @@ def main():
     caption_bm25_index = None
     model = None
     reranker = None
+    resolved_reranker_adapter = None
 
     def load_embedding_model():
         nonlocal model
@@ -1336,7 +1436,7 @@ def main():
         release_accelerator_memory()
 
     def load_reranker():
-        nonlocal reranker
+        nonlocal reranker, resolved_reranker_adapter
 
         if reranker is None:
             unload_embedding_model()
@@ -1381,21 +1481,31 @@ def main():
                 default_prompt_name="query",
             )
 
+            if args.reranker_adapter is not None:
+                requested = resolve_adapter_path(args.reranker_adapter)
+                resolved_reranker_adapter = attach_adapter(
+                    reranker,
+                    requested,
+                    adapter_name=RERANKER_ADAPTER_NAME,
+                )
+                print(f"再ランカーアダプタをロードしました: {resolved_reranker_adapter}")
+
         return reranker
 
     def load_image_dates_once():
         nonlocal image_dates
 
-        if image_dates is None and IMAGE_DATES_PATH.exists():
-            image_dates = load_image_dates(IMAGE_DATES_PATH)
+        image_dates_path = args.data_dir / IMAGE_DATES_PATH.name
+        if image_dates is None and image_dates_path.exists():
+            image_dates = load_image_dates(image_dates_path)
 
         return image_dates
 
     def load_image_search_backend(*, load_query_embedding_model: bool = True):
         nonlocal image_index, image_paths
 
-        index_path = DATA_DIR / "images.faiss"
-        paths_path = DATA_DIR / "image_paths.json"
+        index_path = args.data_dir / "images.faiss"
+        paths_path = args.data_dir / "image_paths.json"
 
         if image_index is not None and image_paths is not None:
             embedding_model = load_embedding_model() if load_query_embedding_model else None
@@ -1411,7 +1521,12 @@ def main():
         image_index = faiss.read_index(str(index_path))
 
         with open(paths_path, "r", encoding="utf-8") as f:
-            image_paths = json.load(f)
+            image_paths = resolve_index_image_paths(json.load(f), args.image_dir)
+        if image_index.ntotal != len(image_paths):
+            raise RuntimeError(
+                f"{index_path} の件数 ({image_index.ntotal}) と {paths_path} の件数 "
+                f"({len(image_paths)}) が一致しません。"
+            )
 
         embedding_model = load_embedding_model() if load_query_embedding_model else None
         return image_index, image_paths, load_image_dates_once(), embedding_model
@@ -1621,6 +1736,13 @@ def main():
             )
 
         if args.rerank_candidates > 0:
+            initial_ranks = {
+                result.image_id: rank
+                for rank, result in enumerate(
+                    ranked_results[: args.rerank_candidates],
+                    start=1,
+                )
+            }
             reranker_query = build_reranker_query(search_query)
             ranked_results = rerank_search_results(
                 ranked_results,
@@ -1632,6 +1754,7 @@ def main():
             )
         else:
             reranker_query = None
+            initial_ranks = {}
 
         top_results = ranked_results[: args.top_k]
         bottom_results = [] if args.bottom_k == 0 else ranked_results[-args.bottom_k :]
@@ -1644,10 +1767,65 @@ def main():
             with open(result_dir / "reranker_query.txt", "w", encoding="utf-8") as f:
                 f.write(reranker_query + "\n")
 
+        adapter_for_report = (
+            resolved_reranker_adapter
+            if resolved_reranker_adapter is not None
+            else (
+                resolve_adapter_path(args.reranker_adapter)
+                if args.reranker_adapter is not None
+                else None
+            )
+        )
+        write_search_metadata(
+            result_dir,
+            {
+                "created_at": datetime.now().astimezone().isoformat(),
+                "raw_query": raw_query,
+                "search_query": search_query,
+                "reranker_query": reranker_query,
+                "mode": args.mode,
+                "data_dir": str(args.data_dir.expanduser().resolve()),
+                "image_dir": (
+                    str(args.image_dir.expanduser().resolve()) if args.image_dir else None
+                ),
+                "indexed_images": len(image_paths),
+                "reranker_model": args.reranker_model if reranker_query is not None else None,
+                "reranker_adapter": (
+                    str(adapter_for_report) if adapter_for_report is not None else None
+                ),
+                "reranker_variant": (
+                    "adapter" if adapter_for_report is not None else "base"
+                ) if reranker_query is not None else None,
+                "rerank_candidates": args.rerank_candidates,
+                "top_k": args.top_k,
+            },
+        )
+        if reranker_query is not None:
+            candidate_records = build_reranker_candidate_records(
+                ranked_results,
+                image_paths,
+                initial_ranks=initial_ranks,
+                candidate_count=args.rerank_candidates,
+            )
+            for record in candidate_records:
+                record["raw_query"] = raw_query
+                record["search_query"] = search_query
+                record["reranker_query"] = reranker_query
+                record["reranker_variant"] = (
+                    "adapter" if adapter_for_report is not None else "base"
+                )
+                record["relevance"] = None
+            write_jsonl_records(result_dir / "reranker_candidates.jsonl", candidate_records)
+
         print(f"search mode: {args.mode}")
         print(f"search query: {search_query}")
         if reranker_query is not None and reranker_query != search_query:
             print(f"reranker query: {reranker_query}")
+        if reranker_query is not None:
+            print(
+                "reranker variant: "
+                + (f"adapter ({adapter_for_report})" if adapter_for_report else "base")
+            )
         print(f"results: {result_dir}")
         print()
 

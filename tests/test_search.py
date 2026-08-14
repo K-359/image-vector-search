@@ -1,9 +1,14 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.search import (
+    SearchResult,
     WRONG_WAY_BICYCLE_QUERY,
+    build_reranker_candidate_records,
     build_reranker_query,
+    resolve_index_image_paths,
     resolve_caption_index_embedding_device,
 )
 
@@ -63,6 +68,45 @@ class ResolveCaptionIndexEmbeddingDeviceTest(unittest.TestCase):
                 "cpu",
             )
 
+
+class ResolveIndexImagePathsTest(unittest.TestCase):
+    def test_keeps_stored_paths_without_override(self):
+        paths = ["images/a.jpg", "images/b.jpg"]
+        self.assertIs(resolve_index_image_paths(paths, None), paths)
+
+    def test_remaps_old_paths_by_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_dir = Path(directory)
+            for name in ("a.jpg", "b.jpg"):
+                (image_dir / name).touch()
+            self.assertEqual(
+                resolve_index_image_paths(["old/a.jpg", "old/b.jpg"], image_dir),
+                [str((image_dir / "a.jpg").resolve()), str((image_dir / "b.jpg").resolve())],
+            )
+
+    def test_rejects_missing_remapped_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "1 件の画像が見つかりません"):
+                resolve_index_image_paths(["old/missing.jpg"], Path(directory))
+
+
+class BuildRerankerCandidateRecordsTest(unittest.TestCase):
+    def test_records_initial_and_reranked_ranks(self):
+        results = [
+            SearchResult(0.9, 20, retrieval_score=0.2, reranker_score=0.9),
+            SearchResult(0.8, 10, retrieval_score=0.4, reranker_score=0.8),
+            SearchResult(0.7, 30, retrieval_score=0.1, reranker_score=0.7),
+        ]
+        records = build_reranker_candidate_records(
+            results,
+            [f"images/{index}.jpg" for index in range(31)],
+            initial_ranks={10: 1, 20: 2},
+            candidate_count=2,
+        )
+        self.assertEqual(
+            [(record["image_id"], record["retrieval_rank"], record["reranker_rank"]) for record in records],
+            [(20, 2, 1), (10, 1, 2)],
+        )
 
 if __name__ == "__main__":
     unittest.main()

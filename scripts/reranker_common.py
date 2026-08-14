@@ -23,6 +23,7 @@ from search import (  # noqa: E402
     RERANKER_MODEL_NAME,
     build_reranker_query,
 )
+from reranker_adapter import attach_adapter, resolve_adapter_path  # noqa: E402
 
 __all__ = [
     "DASHCAM_RERANKER_PROMPT",
@@ -40,9 +41,6 @@ __all__ = [
     "build_predict_pairs",
     "validate_pair_captions",
 ]
-
-DEFAULT_ADAPTER_NAME = "dashcam"
-
 
 # ---------------------------------------------------------------------------
 # JSONL ユーティリティ
@@ -185,21 +183,6 @@ def resolve_image_path(image_path: str, project_root: Path) -> Path:
     return (project_root / candidate).resolve()
 
 
-def resolve_adapter_path(adapter_path: Path) -> Path:
-    """
-    run 管理形式の ``best`` と、旧形式の直下アダプタの両方を解決する。
-
-    新形式を優先することで、旧形式の重みを残したまま安全に移行できる。
-    """
-
-    promoted = adapter_path / "best"
-    if (promoted / "adapter_config.json").is_file():
-        return promoted.resolve()
-    if (adapter_path / "adapter_config.json").is_file():
-        return adapter_path.resolve()
-    return adapter_path.resolve()
-
-
 # ---------------------------------------------------------------------------
 # Reranker のロードとスコアリング
 # ---------------------------------------------------------------------------
@@ -273,62 +256,6 @@ def load_reranker(
         prompts={"query": "Retrieve text relevant to the user's query."},
         default_prompt_name="query",
     )
-
-
-def attach_adapter(model, adapter_path: Path, *, adapter_name: str = DEFAULT_ADAPTER_NAME) -> None:
-    """
-    学習済み LoRA アダプタを、ロード済みの CrossEncoder へ取り付ける。
-
-    transformers の load_adapter は内部で _load_pretrained_model を通り、
-    アダプタではなくモデル全体のサイズでメモリを先取りしようとする。
-    量子化済みの重みが既に載っている状態では、これが VRAM 16GB では確保に失敗する。
-    そのため、学習時と同じ add_adapter で層だけ注入し、重みは後から流し込む。
-    """
-
-    import json as json_module
-
-    from peft import LoraConfig, load_peft_weights, set_peft_model_state_dict
-
-    adapter_path = resolve_adapter_path(adapter_path)
-    config_path = adapter_path / "adapter_config.json"
-    if not config_path.exists():
-        raise RuntimeError(f"{config_path} がありません。アダプタのパスを確認してください。")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw_config = json_module.load(f)
-
-    lora_config = LoraConfig(
-        **{
-            key: value
-            for key, value in raw_config.items()
-            if key in LoraConfig.__dataclass_fields__ and key != "task_type"
-        },
-        task_type=raw_config.get("task_type"),
-    )
-    model.add_adapter(lora_config, adapter_name=adapter_name)
-    model.set_adapter(adapter_name)
-
-    state_dict = load_peft_weights(str(adapter_path))
-    result = set_peft_model_state_dict(
-        model.transformers_model, state_dict, adapter_name=adapter_name
-    )
-
-    unexpected = list(getattr(result, "unexpected_keys", []) or [])
-    if unexpected:
-        raise RuntimeError(
-            f"アダプタの重みに未知のキーがあります (先頭5件): {unexpected[:5]}"
-        )
-
-    loaded = sum(
-        1
-        for name, parameter in model.transformers_model.named_parameters()
-        if "lora_B" in name and adapter_name in name and float(parameter.abs().sum()) > 0
-    )
-    if loaded == 0:
-        raise RuntimeError(
-            f"{adapter_path} の LoRA 重みが読み込まれていません "
-            "(lora_B がすべて0のため、ベースモデルと同じ出力になります)。"
-        )
 
 
 def build_predict_pairs(
