@@ -461,12 +461,24 @@ Ollama の教師モデルで、画像1枚ごとに「シーンカード」を生
 シーンカードは、画像に写っている事実を決められた語彙で構造化したものと、
 その画像を検索するための日本語クエリを含みます。
 
+教師モデルのローカル別名を初回だけ作成します。
+
+```bash
+ollama create qwen3.8-27b-mtp:ud-q3_k_xl -f Modelfile.qwen3.8-27b-mtp
+```
+
+この定義は `unsloth/Qwen3.8-27B-GGUF` の `UD-Q3_K_XL` を使い、
+本体GGUFに内蔵されたMTPを `draft_num_predict 4` で有効化します。
+外部draft modelは指定しないため、別配布の `mtp-Qwen3.8-27B-Q4_0.gguf` は不要です。
+RTX 4070 Ti SUPER (16GB) では `num_gpu 999` で全モデル層をGPUへ配置し、
+`num_batch 128` と `num_ctx 4096` でvision用のVRAMを確保します。
+
 ```bash
 python scripts/build_reranker_dataset.py --num-images 1000
 ```
 
 デフォルトでは `images_100k/` から 1000 枚を決定的にサンプリングし、
-`hf.co/unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q3_K_XL` でラベリングして
+`qwen3.8-27b-mtp:ud-q3_k_xl`（Qwen3.8-27B / UD-Q3_K_XL）でラベリングして
 `datasets/dashcam_reranker_ft_v1/` へ書き出します。
 RTX 4070 Ti SUPER (16GB) では1枚あたり20〜40秒、1000枚で6〜11時間程度かかります。
 1件ずつ追記保存し、既にカードがある画像は自動でスキップするため、途中で止めても同じコマンドで再開できます。
@@ -607,7 +619,7 @@ Ollama はリクエスト後もしばらくモデルを保持するため、16GB
 `CUDA error: out of memory` で失敗します。
 
 ```bash
-curl -s http://localhost:11434/api/chat -d '{"model":"hf.co/unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q3_K_XL","messages":[],"keep_alive":0}'
+curl -s http://localhost:11434/api/chat -d '{"model":"qwen3.8-27b-mtp:ud-q3_k_xl","messages":[],"keep_alive":0}'
 ```
 
 ```bash

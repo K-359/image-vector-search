@@ -1,0 +1,12 @@
+FROM hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q3_K_XL
+
+# Qwen3.8-27B の本体GGUFに内蔵されたMTP層を使う。
+# DRAFT は指定せず、外部draft modelはロードしない。
+PARAMETER draft_num_predict 4
+
+# RTX 4070 Ti SUPER (16GB) でモデルをGPUへ収めるための既定値。
+PARAMETER num_ctx 4096
+
+# 全モデル層をGPUへ配置し、vision用のVRAMを確保するためbatchを抑える。
+PARAMETER num_gpu 999
+PARAMETER num_batch 128

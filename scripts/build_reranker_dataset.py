@@ -4,7 +4,7 @@ Qwen3-VL-Reranker-8B のドライブレコーダ特化ファインチューニ�
 処理は2段階に分かれる。
 
 1. cards:  BDD100k からサンプリングした画像 1枚ごとに、Ollama の教師モデル
-           (既定 hf.co/unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q3_K_XL) で
+           (既定 qwen3.8-27b-mtp:ud-q3_k_xl) で
            「シーンカード」を生成する。シーンカードは、画像に写っている事実を
            制約付きの語彙で構造化したものと、その画像から答えられる検索クエリを含む。
 2. pairs:  シーンカードから (クエリ, 候補画像) ペアを機械的に構成する。
@@ -69,7 +69,7 @@ PROMPT_VERSION = "dashcam-scene-card-v1"
 
 DEFAULT_IMAGE_DIR = "images_100k"
 DEFAULT_DATASET_DIR = "datasets/dashcam_reranker_ft_v1"
-DEFAULT_TEACHER_MODEL = "hf.co/unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q3_K_XL"
+DEFAULT_TEACHER_MODEL = "qwen3.8-27b-mtp:ud-q3_k_xl"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_TIMEOUT = 900.0
 
