@@ -32,4 +32,4 @@ tail -f results/qlora-v3-conditions-20260925T055127Z/train.log
 cat results/qlora-v3-conditions-20260925T055127Z/status.json
 ```
 
-テストデータでの学習前後比較は学習完了後に行います。
+2026-09-25 21:26 JSTに正常終了しました（val nDCG@5 0.768→0.977）。testでの学習前後比較は[評価結果](condition-eval.md)にまとめています。

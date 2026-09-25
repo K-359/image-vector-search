@@ -467,7 +467,8 @@ scripts/reranker_common.py          3つのスクリプトが共有するモデ�
 [新規データ処理と50枚試行の実行手順](docs/condition-data-pipeline.md)では、候補選定・画像事実のスキーマ・判定不能を保持する条件判定の実装を説明しています。
 [50枚の試行結果](docs/reports/condition-pilot-50.md)には、実測時間、再試行、乗り手の分類や場面ラベルの不整合などの品質確認事項を記録しています。
 [5,000枚の選定結果](docs/reports/condition-selection-5000.md)には、確定した学習3,500枚・検証500枚・評価1,000枚の配分と、条件別の検索候補数を記録しています。条件への実際の適合数はラベル生成後に集計します。
-[学習・評価用ペアの作成結果](docs/reports/condition-pairs.md)に、学習11,072件・検証2,241件・評価4,964件の出力と条件別不足を記録しています。2026-09-25に[QLoRA学習を開始](docs/reports/condition-qlora.md)しました。
+[学習・評価用ペアの作成結果](docs/reports/condition-pairs.md)に、学習11,072件・検証2,241件・評価4,964件の出力と条件別不足を記録しています。2026-09-25に[QLoRA学習](docs/reports/condition-qlora.md)を行い、[test評価](docs/reports/condition-eval.md)でnDCG@5が0.792から0.982に改善しました（教師ラベル基準）。
+条件の種類別の集計は `scripts/analyze_condition_eval.py` で行います。
 既存1,000枚をこの要求に照らした[候補集計と画像確認](docs/reports/search-coverage-review.md)も保存しています。
 カード上の候補数は `python3 scripts/audit_search_coverage.py` で再集計できます。
 
