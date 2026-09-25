@@ -457,6 +457,20 @@ scripts/reranker_common.py          3つのスクリプトが共有するモデ�
 
 ### 1. データセットを作る
 
+次のデータ構築に向けた検索条件の分類・具体例・正解判定の規則は、
+[検索条件の定義（初版）](docs/search-condition-taxonomy.md) にまとめています。
+具体的なクエリと正例・負例・判定不能の基準は、
+[検索要求と正解判定基準](docs/search-requirements.md) を参照してください。
+画像選定に使う[検索条件一覧 v1（233条件）](docs/search-condition-catalog.md)には、基本200条件・評価専用の組み合わせ20条件などの必須条件と要求例との対応を列挙しています。
+新規構築の[件数・配分案](docs/dataset-allocation-plan.md)では、条件別の目標と学習・検証・評価の規模を整理しています。
+[画像配分と選定手順](docs/image-selection-plan.md)では、条件を狙う4,000枚＋無作為1,000枚の配分、[条件別の目標件数](docs/search-condition-allocation.csv)、元画像と索引の確認結果をまとめています。
+[新規データ処理と50枚試行の実行手順](docs/condition-data-pipeline.md)では、候補選定・画像事実のスキーマ・判定不能を保持する条件判定の実装を説明しています。
+[50枚の試行結果](docs/reports/condition-pilot-50.md)には、実測時間、再試行、乗り手の分類や場面ラベルの不整合などの品質確認事項を記録しています。
+[5,000枚の選定結果](docs/reports/condition-selection-5000.md)には、確定した学習3,500枚・検証500枚・評価1,000枚の配分と、条件別の検索候補数を記録しています。条件への実際の適合数はラベル生成後に集計します。
+[学習・評価用ペアの作成結果](docs/reports/condition-pairs.md)に、学習11,072件・検証2,241件・評価4,964件の出力と条件別不足を記録しています。2026-09-25に[QLoRA学習を開始](docs/reports/condition-qlora.md)しました。
+既存1,000枚をこの要求に照らした[候補集計と画像確認](docs/reports/search-coverage-review.md)も保存しています。
+カード上の候補数は `python3 scripts/audit_search_coverage.py` で再集計できます。
+
 Ollama の教師モデルで、画像1枚ごとに「シーンカード」を生成します。
 シーンカードは、画像に写っている事実を決められた語彙で構造化したものと、
 その画像を検索するための日本語クエリを含みます。

@@ -1,0 +1,39 @@
+{
+  "facts_count": 5000,
+  "complete": true,
+  "old_4998_records_unchanged": true,
+  "old_pilot_labels_reused": false,
+  "split_counts": {
+    "train": 3500,
+    "val": 500,
+    "test": 1000
+  },
+  "condition_judgments": 1165000,
+  "retry_results": [
+    {
+      "image_id": "df321c23-20cb4f4f",
+      "output_tokens": 4212,
+      "seconds": 39.40991479594959,
+      "generation_options": {
+        "temperature": 0,
+        "num_ctx": 8192,
+        "num_predict": 8192
+      }
+    },
+    {
+      "image_id": "85580e1b-ef6bd280",
+      "output_tokens": 4119,
+      "seconds": 38.35137831000611,
+      "generation_options": {
+        "temperature": 0,
+        "num_ctx": 8192,
+        "num_predict": 8192
+      }
+    }
+  ],
+  "facts_sha256": "a95aacfd94bcc87b6e24431ad3f3ff99a54d66297d171bba0976407cd250d2f4",
+  "manifest_sha256": "fdce80275fbb336a2fe3b4a5d497b9da916c62da82ee17c95b4140dc9c7e1328",
+  "report_sha256": "ed97bf925a617ed3c6cbb79786c48e6a08208194fe2459f67ffa9a2e6b380516",
+  "content_consistency_validation": "disabled",
+  "training_started": false
+}

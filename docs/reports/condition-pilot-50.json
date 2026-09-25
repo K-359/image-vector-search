@@ -1,0 +1,46 @@
+{
+  "created_at": "2026-09-24T03:29:00.842118+00:00",
+  "dataset_dir": "datasets/dashcam_reranker_v3_conditions",
+  "pilot_images": 50,
+  "split": "train",
+  "routes": {
+    "condition": 40,
+    "random": 10
+  },
+  "runtime_seconds": {
+    "inventory": 43.08495604200289,
+    "retrieval": 4.616693437041249,
+    "candidate_preparation": 0.7580204589758068,
+    "annotation_runs_including_failures": 1008.5740797170438,
+    "visual_review": null
+  },
+  "teacher_calls": 53,
+  "rejected_responses": 3,
+  "final_facts": 50,
+  "flagged_images": 12,
+  "flags": {
+    "possible_rider_as_pedestrian": 6,
+    "conflicting_time_of_day": 2,
+    "object_limit_reached": 2,
+    "repeated_object_evidence": 3,
+    "visual_review_issue": 2
+  },
+  "median_successful_call_seconds": 16.443511600984493,
+  "rough_5000_hours_successful_calls_excluding_first": 24.432780701981077,
+  "rough_5000_hours_total_annotation_runtime": 28.015946658806772,
+  "teacher_derived_positive_conditions": 146,
+  "condition_count_static": 227,
+  "heldout_conditions_not_used_for_training": 20,
+  "training_pairs_exported": 0,
+  "training_launched": false,
+  "full_5000_generation_launched": false,
+  "tests_passed": 53,
+  "artifacts_sha256": {
+    "manifests/pilot_50.jsonl": "400eae796c34007f2354c793ba2a74be476049d771ba47300f875212a8a8dae0",
+    "pilot/facts.jsonl": "f5b0ca2a3bf77bfa0f65b24c0062acd01373dd3069602199b4ab419142b40d22",
+    "pilot/condition_judgments.jsonl": "d714a886796a1858e1ed9381fc4714dae58e0ab902b1788867ec878cdd97d367",
+    "pilot/quality_reviews.jsonl": "7c59e208c2e11405c07cf2863104fd998d80c91711c952d1333dd62b28f1e37f",
+    "pilot/report.json": "f462edc9f7bf52627ee6aeb0799ac9cc6a8d425d077a2b425565c8ac664648de",
+    "selection/rankings.jsonl": "4c4ba405fb94301637a2d76964fc7c5a26886f58ef900f5e08ff74089f7c2008"
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "schema_version": "condition-pairs-v1",
+  "seed": 20260924,
+  "teacher_only": true,
+  "pair_exported": true,
+  "training_launched": false,
+  "sources_sha256": {
+    "manifests/selected_5000.jsonl": "fdce80275fbb336a2fe3b4a5d497b9da916c62da82ee17c95b4140dc9c7e1328",
+    "annotations/facts.jsonl": "a95aacfd94bcc87b6e24431ad3f3ff99a54d66297d171bba0976407cd250d2f4",
+    "annotations/condition_judgments.jsonl": "bb9c389674818a1c8ffe7ca8fa0d7d60c96b3bc4bbe365adbc27e146c21649c7",
+    "annotations/annotation_config.json": "9c4f2578312f78c1f15aa148d3aad4ad168a1821a51644bd1dbeb0ee763d7203",
+    "annotations/report.json": "ed97bf925a617ed3c6cbb79786c48e6a08208194fe2459f67ffa9a2e6b380516",
+    "selection/rankings.jsonl": "4c4ba405fb94301637a2d76964fc7c5a26886f58ef900f5e08ff74089f7c2008"
+  },
+  "catalog_sha256": "509c375a0b8cb30022fad42e093d30aefcaa2b5d04ab14d6717a2854699a3c4d",
+  "allocation_sha256": "162937048da77136b5eb4e574022426882fbf8807a24540d16d0eda0a0baa131",
+  "builder_sha256": "dd31c3b6770c21ea5bf1e200416b2d9eee2a1d32a6ac1548c65d5fd6f6b73ac5",
+  "caption_mode": "image only; captions are not generated",
+  "positive_sampling": "prefer fewer prior uses, then seeded tie break",
+  "negative_sampling": "up to half (rounded up) high-retrieval-ranked known negatives; remainder fewer prior uses then seeded tie break",
+  "coverage_scope": "teacher-derived; absent positive/negative queries omitted from pairs but listed in coverage",
+  "query_split_policy": "shared fixed basic/composite queries across disjoint images; H queries only in test",
+  "sequence_independence": "unverified; exact content groups isolated",
+  "splits": {
+    "train": {
+      "manifest_images": 3500,
+      "paired_images": 3500,
+      "unpaired_images": 0,
+      "queries": 204,
+      "pairs": 11072,
+      "positive_pairs": 6992,
+      "negative_pairs": 4080,
+      "negative_types": {
+        "hard_negative": 1899,
+        "random_negative": 2181
+      },
+      "condition_statuses": {
+        "targets_met": 146,
+        "below_target": 58,
+        "no_positive": 3,
+        "deferred_temporal": 6,
+        "excluded_heldout": 20
+      }
+    },
+    "val": {
+      "manifest_images": 500,
+      "paired_images": 500,
+      "unpaired_images": 0,
+      "queries": 182,
+      "pairs": 2241,
+      "positive_pairs": 1331,
+      "negative_pairs": 910,
+      "negative_types": {
+        "hard_negative": 492,
+        "random_negative": 418
+      },
+      "condition_statuses": {
+        "targets_met": 132,
+        "no_positive": 25,
+        "below_target": 50,
+        "deferred_temporal": 6,
+        "excluded_heldout": 20
+      }
+    },
+    "test": {
+      "manifest_images": 1000,
+      "paired_images": 1000,
+      "unpaired_images": 0,
+      "queries": 207,
+      "pairs": 4964,
+      "positive_pairs": 2894,
+      "negative_pairs": 2070,
+      "negative_types": {
+        "random_negative": 1108,
+        "hard_negative": 962
+      },
+      "condition_statuses": {
+        "targets_met": 141,
+        "no_positive": 20,
+        "below_target": 66,
+        "deferred_temporal": 6
+      }
+    }
+  },
+  "outputs_sha256": {
+    "pairs.train.jsonl": "ed35b25de7ced553f42636f2b6330a85564b66a91e462b54381f34fd7c8e4558",
+    "pairs.val.jsonl": "4cacab614e050b31922e9a255441edf2cb0fef11719dc061f8fe78fb7107ecbe",
+    "pairs.test.jsonl": "f48b3c52e455430d5e92106cc633e3e1b286d0b35d82d4bb4162c491c040aa0a",
+    "derived/queries.jsonl": "7cc92d359c54ec97dbec893ccaf5606ff1a542e250ece1bbe516b144a942d83e"
+  },
+  "verification": {
+    "unit_tests_passed": 73,
+    "pairs_match_saved_judgments": 18277,
+    "real_pair_loader": "passed",
+    "real_evaluator_interface_with_fixture_scores": "passed; not model evaluation",
+    "all_selected_images_used": 5000,
+    "repeat_export_identical": true
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "method": "balanced_retrieval_v1",
+  "seed": 20260924,
+  "complete_image_budget": true,
+  "split_counts": {
+    "train": 3500,
+    "val": 500,
+    "test": 1000
+  },
+  "target_counts": {
+    "train": 3500,
+    "val": 500,
+    "test": 1000
+  },
+  "unfilled_image_slots": {
+    "train": 0,
+    "val": 0,
+    "test": 0
+  },
+  "selection_route_counts": {
+    "random": 1000,
+    "condition": 4000
+  },
+  "rank_band_targets": {
+    "train": {
+      "top": 1400,
+      "middle": 700,
+      "tail": 700
+    },
+    "val": {
+      "top": 200,
+      "middle": 100,
+      "tail": 100
+    },
+    "test": {
+      "top": 400,
+      "middle": 200,
+      "tail": 200
+    }
+  },
+  "rank_band_counts": {
+    "train": {
+      "top": 1400,
+      "middle": 700,
+      "tail": 700
+    },
+    "val": {
+      "top": 200,
+      "middle": 100,
+      "tail": 100
+    },
+    "test": {
+      "top": 400,
+      "middle": 200,
+      "tail": 200
+    }
+  },
+  "coverage_source": "retrieval sampling opportunities only; actual coverage pending annotation",
+  "conditions_without_retrieval_candidates": [],
+  "sequence_independence": "unverified; groups represent exact content duplicates",
+  "candidate_visual_review": "not required for this selection; pilot review retained",
+  "quality_policy": "record existing pilot issues; no additional remediation or repeated pilot required",
+  "inputs_sha256": {
+    "manifests/random_1000.jsonl": "fcb17827caa8baeace091d0b64d64a0d45f34e9e978c11adf5318c60ca596e56",
+    "manifests/pilot_50.jsonl": "400eae796c34007f2354c793ba2a74be476049d771ba47300f875212a8a8dae0",
+    "selection/candidates.jsonl": "8fb820aca705c90153b67841fcc6a75c2e0dbd9befe1d47a76fd1cc4aba7704f",
+    "selection/retrieval.json": "a553f2784df0ff6a8dfbebcc50a58896e363447838025467ab788159a9e574bf",
+    "catalog_sha256": "509c375a0b8cb30022fad42e093d30aefcaa2b5d04ab14d6717a2854699a3c4d",
+    "allocation_sha256": "162937048da77136b5eb4e574022426882fbf8807a24540d16d0eda0a0baa131"
+  },
+  "selector_sha256": "8a8d107ff0e7f042f8a8e2bd74481740c9b655880b601283f36e9f39596c3d08",
+  "source_hashes_verified": 5000,
+  "manifest_sha256": "fdce80275fbb336a2fe3b4a5d497b9da916c62da82ee17c95b4140dc9c7e1328",
+  "created_at": "2026-09-24T04:02:01.580662+00:00",
+  "dataset_dir": "datasets/dashcam_reranker_v3_conditions",
+  "candidate_images": 11100,
+  "pilot_images_preserved": 50,
+  "reserved_random_images_preserved": 1000,
+  "near_duplicate_pairs_reviewed": 9,
+  "near_duplicate_merges": 0,
+  "full_5000_generation_launched": false,
+  "unannotated_images": 4950,
+  "near_duplicate_check_sha256": "8160776c4b618014ac3b809325f1e9ab49de0e545c24525ab0015aade2d6b4ca",
+  "sampling_summary": {
+    "train": {
+      "conditions": 207,
+      "minimum_candidate_hits": 19,
+      "maximum_candidate_hits": 54
+    },
+    "val": {
+      "conditions": 207,
+      "minimum_candidate_hits": 5,
+      "maximum_candidate_hits": 18
+    },
+    "test": {
+      "conditions": 227,
+      "minimum_candidate_hits": 10,
+      "maximum_candidate_hits": 38
+    }
+  },
+  "tests_passed": 57
+}

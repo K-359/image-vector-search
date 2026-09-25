@@ -1,0 +1,47 @@
+{
+  "checked_on": "2026-09-24",
+  "scope": "inventory only; no image selection, inference, or training",
+  "source_image_dir": "images_100k",
+  "source_image_count": 100003,
+  "indexed_paths_file": "data_100k/image_paths.json",
+  "indexed_path_count": 100003,
+  "indexed_paths_sha256": "f7d9afcfd59c47c3f0b847d5b8994fa563b1f07a1315e7f4dc5381fc6fab5ee2",
+  "duplicate_index_basenames": 0,
+  "missing_source_basenames": [],
+  "unindexed_source_basenames": [],
+  "path_resolution": "images_100k / basename(stored_path); require unique basename and existing file",
+  "reserved_demo_paths": [
+    "images/0a0_bicycle-near-miss_intersection.jpg",
+    "images/0a0_vehicle-accident.jpg",
+    "images/0a0_wrong-way-bicycle.jpg"
+  ],
+  "eligible_before_content_dedup": 100000,
+  "index_file": "data_100k/images.faiss",
+  "index_bytes": 820024690,
+  "index_loaded_with_faiss": false,
+  "index_reason_not_loaded": "faiss is unavailable in current python3; binary validity, vector IDs and embeddings are not verified",
+  "index_metadata_file_exists": false,
+  "related_subset_metadata_file": "data_10k/images_meta.json",
+  "embedding_provenance_status": "subset metadata is a hint; original index model/prompt provenance must be checked before retrieval",
+  "dates_assignment": "balanced_date_labels_shuffled_across_image_paths",
+  "dates_image_count": 100000,
+  "dates_usable_as_capture_time": false,
+  "full_corpus_condition_labels_found": false,
+  "label_search_scope": "workspace top-level and data, data_10k, data_100k files inspected; no original annotation file identified",
+  "existing_captions": {
+    "data_100k/exp200_captions.jsonl": 200,
+    "data/image_captions.jsonl": 1000
+  },
+  "existing_captions_used_for_selection_or_labels": false,
+  "capture_sequence_metadata_found": false,
+  "exif_check": {
+    "sample_seed": 42,
+    "sample_size": 5,
+    "exif_present": 0,
+    "conclusion": "sample only; does not establish all images lack EXIF"
+  },
+  "selected_image_count": 0,
+  "teacher_calls": 0,
+  "catalog_sha256": "509c375a0b8cb30022fad42e093d30aefcaa2b5d04ab14d6717a2854699a3c4d",
+  "allocation_sha256": "162937048da77136b5eb4e574022426882fbf8807a24540d16d0eda0a0baa131"
+}
