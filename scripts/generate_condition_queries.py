@@ -168,15 +168,20 @@ def verify(url, model, text, target):
 def run(args):
     out = args.out/'queries'
     out.mkdir(parents=True, exist_ok=True)
-    conditions = [c for c in load_conditions() if not c['id'].startswith(UNSUPPORTED_PREFIXES)]
+    if args.conditions:
+        # Extra conditions in the catalog's expression format, e.g. from build_combo_conditions.py.
+        conditions = read_jsonl(args.conditions)
+    else:
+        conditions = [c for c in load_conditions() if not c['id'].startswith(UNSUPPORTED_PREFIXES)]
     if args.only: conditions = [c for c in conditions if c['id'] in set(args.only)]
     tags = request_json(f'{args.ollama_url}/api/tags')['models']
     digest = next(m['digest'] for m in tags if m['name'] == args.teacher)
-    config = {'version':VERSION,'teacher':args.teacher,'teacher_digest':digest,'max_count':MAX_COUNT,
+    config = {'version':VERSION,'teacher':args.teacher,'teacher_digest':digest,'max_count':args.max_count,
               'generate_temperature':args.temperature,'seed':args.seed,
               'generate_prompt_sha256':hashlib.sha256((GENERATE_PROMPT+GLOSSARY).encode()).hexdigest(),
               'parse_prompt_sha256':hashlib.sha256((PARSE_PROMPT+GLOSSARY).encode()).hexdigest(),
               'parse_schema_sha256':hashlib.sha256(json.dumps(parse_schema(),sort_keys=True).encode()).hexdigest()}
+    if args.conditions: config['conditions_sha256'] = hashlib.sha256(args.conditions.read_bytes()).hexdigest()
     config_path = out/'config.json'
     if config_path.exists() and json.loads(config_path.read_text()) != config:
         raise SystemExit(f'{config_path} differs from the current settings; use a different --out')
@@ -189,7 +194,7 @@ def run(args):
         started = time.monotonic()
         target = canonical_target(c['expression'])
         scene = scene_sentence(c['query'])
-        count = MAX_COUNT
+        count = args.max_count
         generated = chat(args.ollama_url, args.teacher,
                          GENERATE_PROMPT.format(count=count, scene=scene, glossary=GLOSSARY),
                          generate_schema(count), temperature=args.temperature,
@@ -249,6 +254,8 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--seed', type=int, default=20260926)
     parser.add_argument('--only', nargs='*', help='condition IDs for a trial run')
+    parser.add_argument('--conditions', type=Path, help='conditions JSONL used instead of the catalog')
+    parser.add_argument('--max-count', type=int, default=MAX_COUNT)
     args = parser.parse_args()
     run(args) if args.command == 'generate' else report(args)
 

@@ -125,8 +125,15 @@ def load_pool():
     return images, records
 
 
-def load_queries(conditions):
-    phrasings = {r['condition_id']: r for r in read_jsonl(PHRASINGS)}
+def load_phrasings(args):
+    """{condition_id: {'heldout': [...]}} from the v3 split, or all verified texts of a generation log."""
+    if not args.queries: return {r['condition_id']: r for r in read_jsonl(PHRASINGS)}
+    return {r['condition_id']: {'heldout': sorted((q['text'] for q in r['queries'] if q['source'] == 'generated' and q['passed']),
+                                                  key=lambda text: stable_key(SEED, f"{r['condition_id']}:{text}"))}
+            for r in read_jsonl(args.queries)}
+
+
+def load_queries(conditions, phrasings):
     queries = []
     for c in conditions:
         heldout = phrasings.get(c['id'], {}).get('heldout', [])
@@ -149,7 +156,8 @@ def retrieve(texts, device):
 
 def run(args):
     started = time.monotonic()
-    conditions = [c for c in load_conditions() if c['expression']['op'] != 'deferred']
+    # Extra conditions (build_combo_conditions.py) replace the catalog when given.
+    conditions = read_jsonl(args.conditions) if args.conditions else [c for c in load_conditions() if c['expression']['op'] != 'deferred']
     images, records = load_pool()
     print(f'pool: {len(records)} annotated images never used by v1-v3', flush=True)
 
@@ -160,7 +168,11 @@ def run(args):
     usable = [c for c in conditions if decided[c['id']].get('yes', 0) and decided[c['id']].get('no', 0)]
     print(f'conditions decidable from BDD labels: {len(usable)}/{len(conditions)}', flush=True)
 
-    queries = load_queries(usable)
+    phrasings = load_phrasings(args)
+    if args.queries:
+        # Extra conditions have no natural reference query to fall back on.
+        usable = [c for c in usable if phrasings.get(c['id'], {}).get('heldout')]
+    queries = load_queries(usable, phrasings)
     rankings = retrieve([q['text'] for q in queries], args.device)
     pairs, per_query = [], []
     for q, hits in zip(queries, rankings):
@@ -189,7 +201,8 @@ def run(args):
     write_jsonl(args.out/'pairs.test.jsonl', pairs)
     write_json(args.out/'reports/build_stats.json', {
         'created_at': now(), 'labels': {s: digest(Path(str(LABELS).format(s))) for s in ('train', 'val')},
-        'phrasings_sha256': digest(PHRASINGS), 'catalog_sha256': digest(ROOT/'docs/search-condition-catalog.md'),
+        'phrasings_sha256': digest(args.queries or PHRASINGS), 'catalog_sha256': digest(ROOT/'docs/search-condition-catalog.md'),
+        'conditions_sha256': digest(args.conditions) if args.conditions else None,
         'index_sha256': digest(ROOT/'data_100k/images.faiss'), 'embedding_model': MODEL, 'embedding_revision': REVISION,
         'min_box_height': MIN_BOX_HEIGHT, 'top_k': TOP_K, 'excluded_datasets': USED_DATASETS,
         'pool_images': len(records), 'conditions_total': len(conditions), 'conditions_decidable': len(usable),
@@ -204,6 +217,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', type=Path, default=OUT)
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--conditions', type=Path, help='conditions JSONL used instead of the catalog')
+    parser.add_argument('--queries', type=Path, help='generate_condition_queries.py log used instead of the v3 test-only paraphrases')
     run(parser.parse_args())
 
 
