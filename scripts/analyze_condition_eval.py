@@ -156,25 +156,32 @@ def main() -> None:
     parser.add_argument("--bootstrap-seed", type=int, default=42)
     args = parser.parse_args()
 
-    by_condition: dict[str, list[dict]] = defaultdict(list)
+    # query_id は condition:<split>:<条件ID>[:<言い換えID>]。言い換えごとに順位を付け、条件内で平均する。
+    by_query: dict[str, list[dict]] = defaultdict(list)
     with args.scores.open() as f:
         for line in f:
             row = json.loads(line)
-            by_condition[row["query_id"].rsplit(":", 1)[-1]].append(row)
+            by_query[row["query_id"]].append(row)
+    by_condition: dict[str, list[list[dict]]] = defaultdict(list)
+    for query_id, rows in by_query.items():
+        by_condition[query_id.split(":")[2]].append(rows)
 
     train_pairs = args.train_pairs or args.scores.parent.parent / "pairs.train.jsonl"
     with train_pairs.open() as f:
         seen_in_train = {json.loads(line)["condition_id"] for line in f}
 
     conditions = {}
-    for condition_id, rows in by_condition.items():
-        if not any(row["label"] for row in rows) or all(row["label"] for row in rows):
+    for condition_id, queries in by_condition.items():
+        queries = [rows for rows in queries if any(r["label"] for r in rows) and not all(r["label"] for r in rows)]
+        if not queries:
             continue  # 正例・負例の片方しかない条件は順位を評価できない
+        per_query = {v: [condition_metrics(rows, v) for rows in queries] for v in VARIANTS}
         conditions[condition_id] = {
-            "query_text": rows[0]["query_text"],
-            "pairs": len(rows),
+            "query_text": " / ".join(rows[0]["query_text"] for rows in queries),
+            "phrasings": len(queries),
+            "pairs": sum(len(rows) for rows in queries),
             "seen_in_train": condition_id in seen_in_train,
-            **{v: condition_metrics(rows, v) for v in VARIANTS},
+            **{v: {k: mean([m[k] for m in ms]) for k in ms[0]} for v, ms in per_query.items()},
         }
 
     options = {"iterations": args.bootstrap_iterations, "seed": args.bootstrap_seed}
