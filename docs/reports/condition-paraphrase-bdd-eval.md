@@ -1,14 +1,15 @@
 # 言い換えクエリの学習と、教師に依存しない評価
 
-評価日: 2026-09-26〜28
+評価日: 2026-09-26〜29
 
 [条件指定データの評価](condition-eval.md)では、クエリがtrain/val/testで同じ基準文で、ラベルもすべて教師モデル（Qwen3.8）の判定でした。
-ここでは作り方を1本に保ったまま、次の4点を確認しました。
+ここでは作り方を1本に保ったまま、次の5点を確認しました。
 
 1. 条件ごとに言い換えた文で学習・評価しても性能が保たれるか（文型への過学習がないか）
 2. 教師に依存しない正解（BDD100K の公式人手ラベル）で比べても、v3 方式が v2 方式（教師が自由にクエリを書く方式）より広く効くか
 3. 学習した条件より長い、3〜4条件の組み合わせのクエリにも効くか
 4. 条件一覧を見ずに書かれたクエリを、条件一覧の語彙でどれだけ表せるか
+5. 見つかった穴を同じ手順で埋められるか（条件一覧の拡張）
 
 ## 当初の課題への答え
 
@@ -44,6 +45,7 @@ v3 はこれに対し、条件一覧でクエリの分布を設計し、ラベ�
   - 「停車している」「走っている」など動きの語（約8割）
   - 一覧にない色・車種（約3割）
 - したがって、課題は作り方から、条件一覧の中身をどこまで広げるかに移っています。
+- 駐車と黄・緑を同じ手順で足すと、表せる割合は15〜24%になり、既存の条件の性能は落ちませんでした（[6節](#6-条件一覧の拡張v4)）。
 
 ## 作り方の変更点
 
@@ -226,20 +228,100 @@ nDCG@10 は次のとおりです（`scripts/analyze_combo_eval.py`）。
 - 対象のクエリも教師 LLM が書いたもので、実際の利用者のクエリではありません。v2 の教師が「停車」を多用するなど、教師の癖が入っています。
 - 逆変換と分類規則には誤りがあります。例えば「街路」を表せない語とした例や、「進行している」の動きを見落とした例がありました。上の割合は目安です。
 
+## 6. 条件一覧の拡張（v4）
+
+5節で見つかった穴のうち、画像1枚で判定でき、実際に絞り込む条件になる2つを、同じ手順で埋めました。
+
+- 追加した語彙: 駐車している乗り物、黄色・緑色の乗り物
+- 追加した条件: 25条件（[拡張カタログ](../search-condition-catalog-extension.md)）
+  - test 専用の未学習の組み合わせ3条件（H21〜H23）を含みます。
+
+### 作り方
+
+v3 の条件・画像・ラベルは変えず、事実を追記しました。
+
+1. **追加の注釈**（`scripts/annotate_extension_facts.py`）
+   - v3 の5,000枚で、記録済みの乗り物に番号付きの枠を描き、同じ教師に「駐車か」「黄・緑か」だけを判定させました。
+   - 1枚あたり約5秒、計6.5時間でした。v3 の注釈を一からやり直すと約23時間かかります。
+   - 4,995枚で成功しました。
+   - 試しの12枚を目で確認したところ、遠くの小さい車にも自信のある答えを返していました。そこで、高さ20px未満の枠は判定不能にしました（BDD 評価と同じ基準です）。
+2. **言い換えの生成**
+   - 用語集に黄・緑・駐車を足し、画像を見ずに言い換えを作って、逆変換で検証しました（`generate_condition_queries.py --extension`）。合格は182/214件（85%）です。
+   - v3 のプロンプトは変えていないことを、ハッシュで確認しました。
+3. **ペアの作成と学習**
+   - ペアの作成と言い換えの割り当ては v3 と同じコードです（`scripts/build_extension_dataset.py`）。
+   - 学習データは、v3 言い換えの学習データに新しい条件の1,105組を足した12,177組です。
+   - 学習の設定は v3 と同じで、val nDCG@5 は0.972でした。
+
+正例の数（train）は、駐車している車が1,520、黄色い車が173でした。緑色は8〜13と少なく、H23（画面右の黄色いバス）は test の正例が1件しかありません。
+
+### 結果
+
+**新しい条件の test**（学習に使っていない言い換え、68クエリ・1,505組、ラベルは教師の判定）
+
+| 区分 | 条件 | base | v3言い換え | v4 | v4 − v3言い換え（95%CI） |
+|---|---:|---:|---:|---:|---|
+| 全体 nDCG@5 | 25 | 0.582 | 0.934 | **0.965** | +0.031 [+0.005, +0.068] |
+| 全体 AUC | 25 | 0.692 | 0.936 | **0.950** | +0.014 [+0.004, +0.028] |
+| 駐車 PRK nDCG@5 | 13 | 0.438 | 0.932 | 0.971 | +0.040 [+0.000, +0.103] |
+| 黄・緑 COL nDCG@5 | 9 | 0.821 | 0.955 | 0.984 | +0.029 [+0.000, +0.072] |
+| 未学習の組み合わせ H nDCG@5 | 3 | 0.485 | 0.877 | 0.877 | ±0 |
+
+- 伸びが大きかった条件: 「市街地に駐車している車」（0.525→0.903）、「画面左に黄色い車」（0.661→0.854）
+- H21「駐車している黄色い車」と H22「夜に駐車しているバン」は、v3言い換えの時点ですでに1.000でした。
+
+**既存の test**（性能が落ちていないかの確認）
+
+| test | 指標 | v3言い換え | v4 | 差（95%CI） |
+|---|---|---:|---:|---|
+| v3 言い換え（203条件、教師ラベル） | nDCG@5 | 0.984 | 0.985 | +0.001 [−0.003, +0.006] |
+| BDD 1〜2条件（73クエリ） | nDCG@10 | 0.919 | 0.908 | −0.012 [−0.030, +0.006] |
+| BDD 3〜4条件（80クエリ） | nDCG@10 | 0.810 | 0.816 | +0.006 [−0.012, +0.025] |
+
+- どの test でも、有意な低下はありませんでした。
+- 例外は、BDD の時間帯・天候の6条件です。AUC が 0.798 から 0.715 に下がり、この差は有意でした。
+  - 主な原因は「雨」（0.941→0.745）と「薄明」（0.885→0.755）です。
+  - 「雨」の負例は2件、「曇り」の負例は1件しかないため、値は不安定です。
+- 道路・信号の条件（ROAD）では、AUC が 0.748 から 0.799 に上がりました。
+
+**網羅率**（5節と同じ測定を、拡張後の語彙で実施。`measure_catalog_coverage.py --extension`）
+
+| | 拡張前 | 拡張後 |
+|---|---:|---:|
+| v1 test（301件） | 9.3% | 23.6% |
+| v2 test（336件） | 6.8% | 15.2% |
+
+- 逆変換は、駐車を正しく読み取ったうえで、同じ語句（「路肩に駐車している」）を表せない部分にも重ねて挙げることがありました。「前方」と同じ種類の重複なので、数えていません。
+- それでも表せないのは、主に次の2つです。どちらも規約で対象外にしたものです。
+  - 走行車線上の「停車」（信号待ちなど）
+  - 走行などの動き
+
+### 解釈
+
+- 見つかった穴を、同じ手順で埋められました。
+  - 必要だったのは、条件一覧の追加、足りない事実だけの追加注釈、言い換えの生成、再学習です。
+  - 表せるクエリの割合は約2.5倍になり、既存の条件の性能は落ちていません。
+- ただし、学習による上積みは小さいです。v3 言い換えのアダプタは、駐車・黄・緑を学習していないのに、新しい条件で base を大きく上回りました（0.582→0.934）。
+  - 考えられる理由は2つです。
+    - 車線・歩道・画面位置など、関連する条件の学習が効いた可能性。
+    - 同じ教師の判定に合わせる学習そのものが、教師の新しい判定にも効いた可能性。
+  - 新しい条件の正解は教師の判定だけです（BDD には駐車も黄・緑もありません）。後者の可能性は否定できません。
+
 ## 考察
 
 - 教師に依存しない正解でも、v3 方式は v2 方式より明確に良い結果でした。差が大きいのは位置の結び付け・共存・画面位置・数や不在の判定で、自由生成の v2 では学習事例が偏っていた組み合わせの条件です。
 - 道路の種類・天候では差がありませんでした。ただし「市街地」「高速道路」などは上位50件の負例が1〜2件しかなく、この区分の比較は弱いです。
 - 言い換えを学習しても、基準文・言い換え・BDD のいずれでも性能は落ちていません。「前方」のように定義を持つ語はむしろ改善しました。言い換えを含む作り方を標準にします。
 - 条件一覧にない3〜4条件の組み合わせにも効いたので、長いクエリ専用の学習データは今のところ必要ないと判断します。
+- 条件一覧の穴は、事実の追記と条件の追加という同じ手順で埋められました（6節）。ただし、新しい語彙での上積みは教師ラベルでしか測れていません。
 
 ## この評価の限界と今後の課題
 
 - BDD で判定できるのは233条件のうち80条件です。色・向き・自車線は、引き続き教師ラベルによる評価だけが根拠です。
 - BDD の人手ラベルにも誤りや定義の違いがあります。見つけたずれには対処しましたが、確認したのは抜き取りです。
-- 実際の利用者がどのようなクエリを書くかは分かっていません。教師が自由に書いたクエリで測ると、今の語彙で表せるのは7〜9%、動きの語を除けば約6割でした（5節）。
+- 実際の利用者がどのようなクエリを書くかは分かっていません。教師が自由に書いたクエリで測ると、今の語彙で表せるのは7〜9%（拡張後15〜24%）、動きの語を除けば約6〜7割でした（5・6節）。
+- 駐車・黄・緑の正解は教師の判定だけです。v3 のアダプタがこれらを学習せずに高い点を取った理由を切り分けるには、教師に依存しない正解が必要です。
 - 条件一覧にない語をどう拾うかが、次の課題です。
-  - 動きの語を対象外のままにするか、停止・駐車のように画像で判定しやすいものだけ加えるかを決める必要があります。
   - 「前方」は用語集で定義して言い換えを学習させると回復しました。
   - 夜の「晴れ」は、条件一覧の定義を「夜は天候を問わない」とするか、BDD に合わせるかを決める必要があります。
 
@@ -248,6 +330,8 @@ nDCG@10 は次のとおりです（`scripts/analyze_combo_eval.py`）。
 - 言い換え: `datasets/dashcam_reranker_v3_paraphrase/queries/`（生成・検証結果）、`pairs.*.jsonl`、`reports/`
 - BDD test: `datasets/dashcam_reranker_bdd_eval/pairs.test.jsonl`、`reports/build_stats.json`（条件・クエリごとのラベル内訳）、`reports/eval_test_bdd-*.{md,json}`
 - 3〜4条件の BDD test: `datasets/dashcam_reranker_bdd_combo/`（`conditions.jsonl`、`queries/`、`pairs.test.jsonl`、`reports/`）
+- 網羅率: `datasets/catalog_coverage/`、`datasets/catalog_coverage_extension/`（`parsed.jsonl`、`report.json`）
+- 拡張（v4）: `datasets/dashcam_reranker_v4_extension/`（`annotations/`、`queries/`、`catalog/`、`pairs.*.jsonl`、`reports/`）、アダプタ `models/qwen3-vl-reranker-8b-dashcam-v4-extension`
 
 ```bash
 python scripts/generate_condition_queries.py generate
@@ -274,4 +358,21 @@ python scripts/compare_query_distribution.py
 
 # 条件一覧の網羅率（出力 datasets/catalog_coverage/）
 python scripts/measure_catalog_coverage.py parse
+
+# 条件一覧の拡張（v4）
+python scripts/annotate_extension_facts.py annotate
+python scripts/generate_condition_queries.py generate --extension --out datasets/dashcam_reranker_v4_extension
+python scripts/build_extension_dataset.py retrieve
+python scripts/build_extension_dataset.py pairs
+python scripts/build_extension_dataset.py combine
+python scripts/train_reranker_qlora.py --dataset-dir datasets/dashcam_reranker_v4_extension \
+    --output-dir models/qwen3-vl-reranker-8b-dashcam-v4-extension --quantization 4bit --epochs 2 \
+    --batch-size 2 --gradient-accumulation-steps 8 --learning-rate 0.0001 --lora-rank 32 --lora-alpha 32 --seed 42
+python scripts/evaluate_reranker.py --dataset-dir datasets/dashcam_reranker_v4_extension --split test \
+    --adapter-path models/qwen3-vl-reranker-8b-dashcam-v4-extension --tag ext-v4
+python scripts/measure_catalog_coverage.py parse --extension
+python scripts/compare_adapters.py \
+    base=datasets/dashcam_reranker_v4_extension/reports/scores_test_ext-v4.jsonl:score_base \
+    v3言換=datasets/dashcam_reranker_v4_extension/reports/scores_test_ext-v3paraphrase.jsonl:score_adapter \
+    v4=datasets/dashcam_reranker_v4_extension/reports/scores_test_ext-v4.jsonl:score_adapter --contrast v3言換:v4
 ```

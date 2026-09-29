@@ -17,10 +17,10 @@ import re
 import time
 
 try:
-    from .condition_data import ROOT, SCENES, load_conditions, read_jsonl, stable_key, write_json
+    from .condition_data import ROOT, SCENES, load_conditions, load_extension_conditions, read_jsonl, stable_key, write_json
     from .build_condition_dataset import append, now, request_json
 except ImportError:
-    from condition_data import ROOT, SCENES, load_conditions, read_jsonl, stable_key, write_json
+    from condition_data import ROOT, SCENES, load_conditions, load_extension_conditions, read_jsonl, stable_key, write_json
     from build_condition_dataset import append, now, request_json
 
 VERSION = 'condition-queries-v3'
@@ -41,6 +41,18 @@ GLOSSARY = '''用語の意味と、使ってよい言い換え:
 - こちらに正面を向けた: 言い換え可「正面を向いた」「こちらを向いた」。後ろ姿が見える: 「後ろ姿の」「背面が見える」。
 - 市街地／住宅街／高速道路／田舎道／トンネル内／橋の上／交差点／横断歩道（が見える）／工事区間／赤信号／青信号／黄信号／濡れた路面／路面の雪（言い換え可「雪道」「雪の積もった道路」）／カーブ／坂道
 - 昼／夜／薄明（言い換え可「薄暮」「夕暮れや明け方」。「夕暮れ」「明け方」の片方だけにしない）／晴れ／曇り／雨が降っている（言い換え可「雨の中」「雨天」）／雪が降っている（言い換え可「降雪中」）／霧'''
+
+# Appended for the extension catalog (docs/search-condition-catalog-extension.md) only, so the
+# v3 prompts and their recorded hashes stay unchanged.
+GLOSSARY_EXTENSION = '''- 黄色／緑色も車体の色。言い換え可「黄色の」「緑の」。「タクシー」など車種名に置き換えない。
+- 駐車している: 走行する車線の外（路肩・駐車場・道路脇）に停めてあること。言い換え可「駐車中の」「停めてある」「路上駐車の」。自転車・バイクは「駐輪されている」も可。「停車している」「止まっている」は信号待ちと区別できないので使わない。'''
+PARSE_EXTENSION = '''- parked: クエリが対象について駐車している（停めてある・駐輪されている）と明示した場合だけ yes、それ以外は none。'''
+
+
+def glossary(extension=False, parse=False):
+    if not extension: return GLOSSARY
+    return GLOSSARY + '\n' + GLOSSARY_EXTENSION + ('\n' + PARSE_EXTENSION if parse else '')
+
 
 GENERATE_PROMPT = '''ドライブレコーダー画像の検索システムに入力する日本語クエリを作ります。
 次の情景を表すクエリを最大{count}件書いてください。
@@ -78,16 +90,19 @@ PARSE_PROMPT = '''ドライブレコーダー画像の検索クエリを読み�
 - クエリに書かれていないことを補わない。'''
 
 
-def parse_schema():
+def parse_schema(extension=False):
     none_or = lambda values: {'type':'string','enum':values+['none']}
     obj = {'type':'object','properties':{
         'kind':{'type':'string','enum':['car','bus','truck','van','pedestrian','bicycle','motorcycle','train','animal','emergency_vehicle','other']},
-        'color':none_or(['white','black','red','blue']),
+        'color':none_or(['white','black','red','blue'] + (['yellow','green'] if extension else [])),
         'position':none_or(['left','center','right']),
         'lane':none_or(['same','left_adjacent','right_adjacent','oncoming']),
         'place':none_or(['sidewalk','crosswalk','roadway']),
         'orientation':none_or(['front','rear']),
     },'required':['kind','color','position','lane','place','orientation']}
+    if extension:
+        obj['properties']['parked'] = none_or(['yes'])
+        obj['required'].append('parked')
     return {'type':'object','properties':{
         'scene':{'type':'array','items':{'type':'string','enum':SCENES}},
         'objects':{'type':'array','items':obj,'maxItems':4},
@@ -126,6 +141,9 @@ def canonical_parse(parsed):
         spec = {'kind':o['kind']}
         for key in ('color','position','lane','orientation'):
             if o[key] != 'none': spec[key] = o[key]
+        # Extension attributes use their own fact keys (annotate_extension_facts.py).
+        if spec.get('color') in ('yellow','green'): spec['color_ext'] = spec.pop('color')
+        if o.get('parked', 'none') != 'none': spec['parked'] = o['parked']
         if o['place'] != 'none': spec[PLACE_KEYS[o['place']]] = 'yes'
         objects.append(spec)
     return normalize(set(parsed['scene']), objects)
@@ -154,9 +172,9 @@ def normalize_text(text):
     return re.sub(r'[\s、。,.]+', '', text)
 
 
-def verify(url, model, text, target):
-    parsed = chat(url, model, PARSE_PROMPT.format(query=text, glossary=GLOSSARY, scenes=', '.join(SCENES)),
-                  parse_schema(), temperature=0, seed=0, num_predict=1024)
+def verify(url, model, text, target, extension=False):
+    parsed = chat(url, model, PARSE_PROMPT.format(query=text, glossary=glossary(extension, parse=True), scenes=', '.join(SCENES)),
+                  parse_schema(extension), temperature=0, seed=0, num_predict=1024)
     actual = canonical_parse(parsed)
     reasons = []
     if actual[0] != target[0]: reasons.append('scene_mismatch')
@@ -171,6 +189,8 @@ def run(args):
     if args.conditions:
         # Extra conditions in the catalog's expression format, e.g. from build_combo_conditions.py.
         conditions = read_jsonl(args.conditions)
+    elif args.extension:
+        conditions = load_extension_conditions()
     else:
         conditions = [c for c in load_conditions() if not c['id'].startswith(UNSUPPORTED_PREFIXES)]
     if args.only: conditions = [c for c in conditions if c['id'] in set(args.only)]
@@ -178,9 +198,10 @@ def run(args):
     digest = next(m['digest'] for m in tags if m['name'] == args.teacher)
     config = {'version':VERSION,'teacher':args.teacher,'teacher_digest':digest,'max_count':args.max_count,
               'generate_temperature':args.temperature,'seed':args.seed,
-              'generate_prompt_sha256':hashlib.sha256((GENERATE_PROMPT+GLOSSARY).encode()).hexdigest(),
-              'parse_prompt_sha256':hashlib.sha256((PARSE_PROMPT+GLOSSARY).encode()).hexdigest(),
-              'parse_schema_sha256':hashlib.sha256(json.dumps(parse_schema(),sort_keys=True).encode()).hexdigest()}
+              'generate_prompt_sha256':hashlib.sha256((GENERATE_PROMPT+glossary(args.extension)).encode()).hexdigest(),
+              'parse_prompt_sha256':hashlib.sha256((PARSE_PROMPT+glossary(args.extension, parse=True)).encode()).hexdigest(),
+              'parse_schema_sha256':hashlib.sha256(json.dumps(parse_schema(args.extension),sort_keys=True).encode()).hexdigest()}
+    if args.extension: config['extension'] = True
     if args.conditions: config['conditions_sha256'] = hashlib.sha256(args.conditions.read_bytes()).hexdigest()
     config_path = out/'config.json'
     if config_path.exists() and json.loads(config_path.read_text()) != config:
@@ -196,7 +217,7 @@ def run(args):
         scene = scene_sentence(c['query'])
         count = args.max_count
         generated = chat(args.ollama_url, args.teacher,
-                         GENERATE_PROMPT.format(count=count, scene=scene, glossary=GLOSSARY),
+                         GENERATE_PROMPT.format(count=count, scene=scene, glossary=glossary(args.extension)),
                          generate_schema(count), temperature=args.temperature,
                          seed=int(stable_key(args.seed, c['id']), 16) % 2**31, num_predict=2048)['queries']
         seen, rows = set(), []
@@ -207,7 +228,7 @@ def run(args):
                 rows.append({'text':text,'source':source,'passed':False,'reasons':['duplicate'],'parsed':None})
                 continue
             seen.add(key)
-            parsed, reasons = verify(args.ollama_url, args.teacher, text, target)
+            parsed, reasons = verify(args.ollama_url, args.teacher, text, target, args.extension)
             if source == 'generated' and META_WORDS.search(text): reasons.append('meta_words')
             rows.append({'text':text,'source':source,'passed':not reasons,'reasons':reasons,'parsed':parsed})
         append(log, {'condition_id':c['id'],'scene':scene,'target':target,'requested':count,'created_at':now(),
@@ -256,6 +277,7 @@ def main():
     parser.add_argument('--only', nargs='*', help='condition IDs for a trial run')
     parser.add_argument('--conditions', type=Path, help='conditions JSONL used instead of the catalog')
     parser.add_argument('--max-count', type=int, default=MAX_COUNT)
+    parser.add_argument('--extension', action='store_true', help='use the extension catalog and its glossary')
     args = parser.parse_args()
     run(args) if args.command == 'generate' else report(args)
 

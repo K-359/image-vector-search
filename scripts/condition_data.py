@@ -27,6 +27,8 @@ ATTR_JA = {
     '自車の右隣の車線': ('lane','right_adjacent'), '対向車線': ('lane','oncoming'),
     '歩道上': ('sidewalk','yes'), '横断歩道上': ('on_crosswalk','yes'), '車道上': ('roadway','yes'),
     '正面がカメラ側': ('orientation','front'), '背面がカメラ側': ('orientation','rear'),
+    # Extension catalog only; the facts come from annotate_extension_facts.py.
+    '黄': ('color_ext','yellow'), '緑': ('color_ext','green'), '駐車': ('parked','yes'),
 }
 
 
@@ -179,15 +181,34 @@ def quality_flags(facts):
     return flags
 
 
+def parse_required(facts):
+    """Expression for a catalog row's required-conditions column of scenes and objects A/B."""
+    terms=[]; objects=[]
+    for part in facts.split('; '):
+        label,value=part.split(': ',1)
+        if label=='場面': terms.append({'op':'scene','name':SCENE_JA[value]})
+        else:
+            if label not in ('対象A','対象B'): raise ValueError(label)
+            kind,*attrs=value.split('・'); spec={'kind':KIND_JA[kind]}
+            for attr in attrs:
+                key,val=ATTR_JA[attr]; spec[key]=val
+            objects.append(spec)
+    if objects: terms.append({'op':'exists','objects':objects})
+    return terms[0] if len(terms)==1 else {'op':'all','terms':terms}
+
+
+def catalog_rows(path, prefixes):
+    for line in path.read_text().splitlines():
+        if re.match(rf'^\| (?:{prefixes})\d{{2}} \|',line):
+            yield [s.strip() for s in line.strip('|').split('|')]
+
+
 def load_conditions(root=ROOT):
     """Compile the fixed catalog, failing on unrecognized predicates or allocation drift."""
     with (root/'docs/search-condition-allocation.csv').open() as f:
         allocations={r['condition_id']:r for r in csv.DictReader(f)}
     conditions=[]
-    for line in (root/'docs/search-condition-catalog.md').read_text().splitlines():
-        if not re.match(r'^\| (?:OBJ|COL|POS|LOC|ORI|ROAD|ENV|CO|CE|CA|CB|H|R|X|D)\d{2} \|',line): continue
-        id,query,facts,seed=[s.strip() for s in line.strip('|').split('|')]
-        terms=[]
+    for id,query,facts,seed in catalog_rows(root/'docs/search-condition-catalog.md','OBJ|COL|POS|LOC|ORI|ROAD|ENV|CO|CE|CA|CB|H|R|X|D'):
         if id.startswith('D'): expr={'op':'deferred'}
         elif id=='R01': expr={'op':'exists','objects':[{'kind':'emergency_vehicle'}]}
         elif id in ('R02','R03'): expr={'op':'exists','objects':[{'kind':'train' if id=='R02' else 'animal'}]}
@@ -195,24 +216,28 @@ def load_conditions(root=ROOT):
         elif id=='X02': expr={'op':'count','kind':'car','count':2}
         elif id=='X03': expr={'op':'not','term':{'op':'exists','objects':[{'kind':'pedestrian'}]}}
         elif id=='X04': expr={'op':'any','terms':[{'op':'exists','objects':[{'kind':k}]} for k in ('bus','truck')]}
-        else:
-            objects=[]
-            for part in facts.split('; '):
-                label,value=part.split(': ',1)
-                if label=='場面': terms.append({'op':'scene','name':SCENE_JA[value]})
-                else:
-                    if label not in ('対象A','対象B'): raise ValueError(label)
-                    kind,*attrs=value.split('・'); spec={'kind':KIND_JA[kind]}
-                    for attr in attrs:
-                        key,val=ATTR_JA[attr]; spec[key]=val
-                    objects.append(spec)
-            if objects: terms.append({'op':'exists','objects':objects})
-            expr=terms[0] if len(terms)==1 else {'op':'all','terms':terms}
+        else: expr=parse_required(facts)
         allocation=allocations.pop(id)
         if allocation['query'] != query: raise ValueError(f'query drift: {id}')
         conditions.append({'id':id,'query':query,'expression':expr,'allocation':allocation})
     if allocations or len(conditions)!=233 or len({c['id'] for c in conditions})!=233:
         raise ValueError('catalog/allocation mismatch')
+    return conditions
+
+
+def load_extension_conditions(root=ROOT):
+    """Conditions added after the coverage check: yellow/green and parked vehicles."""
+    with (root/'docs/search-condition-allocation-extension.csv').open() as f:
+        allocations={r['condition_id']:r for r in csv.DictReader(f)}
+    base={c['id'] for c in load_conditions(root)}
+    conditions=[]
+    for id,query,facts,note in catalog_rows(root/'docs/search-condition-catalog-extension.md','COL|PRK|H'):
+        if id in base: raise ValueError(f'extension reuses a catalog ID: {id}')
+        allocation=allocations.pop(id)
+        if allocation['query'] != query: raise ValueError(f'query drift: {id}')
+        conditions.append({'id':id,'query':query,'expression':parse_required(facts),'allocation':allocation})
+    if allocations or len({c['id'] for c in conditions})!=len(conditions):
+        raise ValueError('extension catalog/allocation mismatch')
     return conditions
 
 
